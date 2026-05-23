@@ -1,0 +1,14 @@
+{
+  "configurations": [
+    {
+      "name": "Mac",
+      "defines": [],
+      "includePath": [
+        "${workspaceFolder}/include",
+        "${workspaceFolder}/vendor/vendor/include"
+      ],
+      "macFrameworkPath": []
+    }
+  ],
+  "version": 4
+}

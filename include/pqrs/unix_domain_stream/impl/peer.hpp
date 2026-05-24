@@ -37,6 +37,7 @@ public:
         ready_deadline_(socket_.get_executor()),
         heartbeat_timer_(socket_.get_executor()),
         heartbeat_deadline_(socket_.get_executor()),
+        read_deadline_(socket_.get_executor()),
         write_deadline_(socket_.get_executor()) {
   }
 
@@ -78,11 +79,7 @@ public:
 
 private:
   void start_heartbeat_timer() {
-    if (!options_.heartbeat_interval) {
-      return;
-    }
-
-    heartbeat_timer_.expires_after(*options_.heartbeat_interval);
+    heartbeat_timer_.expires_after(options_.heartbeat_interval);
 
     auto self = shared_from_this();
     heartbeat_timer_.async_wait([self](const auto& error_code) {
@@ -95,11 +92,7 @@ private:
   }
 
   void refresh_heartbeat_deadline() {
-    if (!options_.heartbeat_timeout) {
-      return;
-    }
-
-    heartbeat_deadline_.expires_after(*options_.heartbeat_timeout);
+    heartbeat_deadline_.expires_after(options_.heartbeat_timeout);
 
     auto self = shared_from_this();
     heartbeat_deadline_.async_wait([self](const auto& error_code) {
@@ -142,10 +135,14 @@ private:
       return;
     }
 
+    start_read_deadline();
+
     auto self = shared_from_this();
     asio::async_read(socket_,
                      asio::buffer(read_header_),
                      [self](auto&& error_code, auto bytes_transferred) {
+                       self->read_deadline_.cancel();
+
                        if (error_code) {
                          self->handle_error(error_code);
                          return;
@@ -169,10 +166,14 @@ private:
   }
 
   void read_body() {
+    start_read_deadline();
+
     auto self = shared_from_this();
     asio::async_read(socket_,
                      asio::buffer(read_body_),
                      [self](auto&& error_code, auto bytes_transferred) {
+                       self->read_deadline_.cancel();
+
                        if (error_code) {
                          self->handle_error(error_code);
                          return;
@@ -222,6 +223,17 @@ private:
                      });
   }
 
+  void start_read_deadline() {
+    read_deadline_.expires_after(options_.read_timeout);
+
+    auto self = shared_from_this();
+    read_deadline_.async_wait([self](const auto& error_code) {
+      if (!error_code) {
+        self->handle_error(asio::error::timed_out);
+      }
+    });
+  }
+
   void push_frame(std::vector<uint8_t> frame) {
     if (!socket_.is_open()) {
       return;
@@ -247,18 +259,15 @@ private:
       return;
     }
 
-    if (options_.write_timeout) {
-      write_deadline_.expires_after(*options_.write_timeout);
-
-      auto self = shared_from_this();
-      write_deadline_.async_wait([self](const auto& error_code) {
-        if (!error_code) {
-          self->handle_error(asio::error::timed_out);
-        }
-      });
-    }
+    write_deadline_.expires_after(options_.write_timeout);
 
     auto self = shared_from_this();
+    write_deadline_.async_wait([self](const auto& error_code) {
+      if (!error_code) {
+        self->handle_error(asio::error::timed_out);
+      }
+    });
+
     asio::async_write(socket_,
                       asio::buffer(write_queue_.front()),
                       [self](auto&& error_code, auto) {
@@ -310,6 +319,7 @@ private:
     ready_deadline_.cancel();
     heartbeat_timer_.cancel();
     heartbeat_deadline_.cancel();
+    read_deadline_.cancel();
     write_deadline_.cancel();
     socket_.cancel(error_code);
     socket_.close(error_code);
@@ -324,6 +334,7 @@ private:
   asio::steady_timer ready_deadline_;
   asio::steady_timer heartbeat_timer_;
   asio::steady_timer heartbeat_deadline_;
+  asio::steady_timer read_deadline_;
   asio::steady_timer write_deadline_;
   std::array<uint8_t, protocol::header_size> read_header_;
   std::vector<uint8_t> read_body_;

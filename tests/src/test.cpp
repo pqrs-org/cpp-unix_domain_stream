@@ -1,4 +1,5 @@
 #include <atomic>
+#include <array>
 #include <boost/ut.hpp>
 #include <iostream>
 #include <pqrs/unix_domain_stream.hpp>
@@ -53,8 +54,6 @@ int main() {
     prepare_socket_file_path(server_socket_file_path);
 
     auto options = make_options();
-    options.reconnect_interval = std::nullopt;
-
     std::atomic<pqrs::unix_domain_stream::peer_id> connected_peer_id = 0;
     std::atomic<size_t> server_received_count = 0;
     std::atomic<size_t> client_received_count = 0;
@@ -164,8 +163,6 @@ int main() {
 
     auto options = make_options();
     options.max_message_size = 8;
-    options.reconnect_interval = std::nullopt;
-
     std::atomic_bool server_bound = false;
     std::atomic_bool error_occurred = false;
 
@@ -274,6 +271,56 @@ int main() {
     dispatcher = nullptr;
   };
 
+  "unix_domain_stream::read_timeout"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::read_timeout)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto options = make_options();
+    options.read_timeout = std::chrono::milliseconds(200);
+
+    std::atomic_bool server_bound = false;
+    std::atomic_bool peer_error_occurred = false;
+    std::atomic_bool peer_closed = false;
+
+    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
+                                                                     server_socket_file_path,
+                                                                     options);
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+    server->peer_error_occurred.connect([&](auto, auto&& error_code) {
+      expect(error_code == asio::error::timed_out);
+      peer_error_occurred = true;
+    });
+    server->peer_closed.connect([&](auto) {
+      peer_closed = true;
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+
+    asio::io_context io_ctx;
+    asio::local::stream_protocol::socket socket(io_ctx);
+    socket.connect(asio::local::stream_protocol::endpoint(server_socket_file_path));
+
+    std::array<uint8_t, 4> header{0, 0, 0, 8};
+    asio::write(socket, asio::buffer(header));
+
+    expect(wait_until([&] { return peer_error_occurred.load(); }));
+    expect(wait_until([&] { return peer_closed.load(); }));
+
+    asio::error_code error_code;
+    socket.close(error_code);
+
+    server = nullptr;
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
   "unix_domain_stream::heartbeat"_test = [] {
     std::cout << "TEST_CASE(unix_domain_stream::heartbeat)" << std::endl;
 
@@ -283,7 +330,6 @@ int main() {
     prepare_socket_file_path(server_socket_file_path);
 
     auto options = make_options();
-    options.reconnect_interval = std::nullopt;
     options.heartbeat_interval = std::chrono::milliseconds(50);
     options.heartbeat_timeout = std::chrono::milliseconds(300);
 

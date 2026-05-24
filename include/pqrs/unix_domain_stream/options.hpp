@@ -6,7 +6,6 @@
 
 #include <chrono>
 #include <cstddef>
-#include <optional>
 
 namespace pqrs::unix_domain_stream {
 
@@ -21,30 +20,28 @@ struct options final {
   size_t max_send_queue_size = 1024;
 
   // Interval used to retry client connect or server bind after a failure.
-  // Set to std::nullopt to disable automatic reconnect/rebind attempts.
-  std::optional<std::chrono::milliseconds> reconnect_interval = std::chrono::milliseconds(1000);
+  std::chrono::milliseconds reconnect_interval = std::chrono::milliseconds(1000);
 
   // Interval used by the server to verify that its socket path is still
   // connectable and that the accepted connection can exchange an internal
   // health-check frame.
-  // Set to std::nullopt to disable server health checks.
-  std::optional<std::chrono::milliseconds> server_check_interval = std::nullopt;
+  std::chrono::milliseconds server_check_interval = std::chrono::milliseconds(3000);
 
   // Maximum time allowed for one server health check.
   std::chrono::milliseconds server_check_timeout = std::chrono::milliseconds(1000);
 
   // Interval used to send heartbeat frames to the peer.
-  // Set to std::nullopt to disable heartbeat sending.
-  std::optional<std::chrono::milliseconds> heartbeat_interval = std::nullopt;
+  std::chrono::milliseconds heartbeat_interval = std::chrono::milliseconds(3000);
 
   // Maximum idle time allowed without receiving any frame from the peer.
   // Heartbeat, health-check and user-data frames all refresh this deadline.
-  // Set to std::nullopt to disable heartbeat timeout checks.
-  std::optional<std::chrono::milliseconds> heartbeat_timeout = std::nullopt;
+  std::chrono::milliseconds heartbeat_timeout = std::chrono::milliseconds(10000);
+
+  // Maximum time allowed for one async read operation.
+  std::chrono::milliseconds read_timeout = std::chrono::milliseconds(5000);
 
   // Maximum time allowed for one async write operation.
-  // Set to std::nullopt to disable write timeouts.
-  std::optional<std::chrono::milliseconds> write_timeout = std::chrono::milliseconds(5000);
+  std::chrono::milliseconds write_timeout = std::chrono::milliseconds(5000);
 };
 
 } // namespace pqrs::unix_domain_stream

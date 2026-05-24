@@ -10,6 +10,7 @@
 #include "impl/peer.hpp"
 #include "options.hpp"
 #include "peer_credentials.hpp"
+#include <atomic>
 #include <filesystem>
 #include <nod/nod.hpp>
 #include <pqrs/dispatcher.hpp>
@@ -70,6 +71,7 @@ public:
 
   void async_start() {
     enqueue_to_dispatcher([this] {
+      stopped_ = false;
       bind();
     });
   }
@@ -102,7 +104,7 @@ public:
 
 private:
   void stop() {
-    options_.reconnect_interval = std::nullopt;
+    stopped_ = true;
     reconnect_timer_.stop();
     server_check_timer_.stop();
 
@@ -117,7 +119,8 @@ private:
 
   void bind() {
     asio::post(io_ctx_, [this] {
-      if (acceptor_) {
+      if (stopped_ ||
+          acceptor_) {
         return;
       }
 
@@ -164,12 +167,19 @@ private:
   }
 
   void accept() {
-    if (!acceptor_) {
+    if (stopped_ ||
+        !acceptor_) {
       return;
     }
 
     acceptor_->async_accept(
         [this](auto&& error_code, auto socket) {
+          if (stopped_) {
+            asio::error_code close_error_code;
+            socket.close(close_error_code);
+            return;
+          }
+
           if (error_code) {
             if (error_code != asio::error::operation_aborted) {
               close_acceptor();
@@ -251,28 +261,33 @@ private:
   void start_reconnect_timer() {
     server_check_timer_.stop();
 
-    if (options_.reconnect_interval) {
-      reconnect_timer_.start(
-          [this] {
-            bind();
-          },
-          *options_.reconnect_interval);
+    if (stopped_) {
+      return;
     }
+
+    reconnect_timer_.start(
+        [this] {
+          bind();
+        },
+        options_.reconnect_interval);
   }
 
   void start_server_check_timer() {
-    if (options_.server_check_interval) {
-      server_check_timer_.start(
-          [this] {
-            server_check();
-          },
-          *options_.server_check_interval);
+    if (stopped_) {
+      return;
     }
+
+    server_check_timer_.start(
+        [this] {
+          server_check();
+        },
+        options_.server_check_interval);
   }
 
   void server_check() {
     asio::post(io_ctx_, [this] {
-      if (!acceptor_ ||
+      if (stopped_ ||
+          !acceptor_ ||
           server_check_in_progress_) {
         return;
       }
@@ -365,6 +380,7 @@ private:
   std::function<bool(const peer_credentials&)> verify_peer_;
   dispatcher::extra::timer reconnect_timer_;
   dispatcher::extra::timer server_check_timer_;
+  std::atomic_bool stopped_ = true;
 
   asio::io_context io_ctx_;
   asio::executor_work_guard<asio::io_context::executor_type> work_guard_;

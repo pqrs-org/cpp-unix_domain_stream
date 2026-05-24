@@ -50,6 +50,7 @@ int main() {
   options.server_check_interval = std::chrono::milliseconds(3000);
   options.heartbeat_interval = std::chrono::milliseconds(3000);
   options.heartbeat_timeout = std::chrono::milliseconds(10000);
+  options.read_timeout = std::chrono::milliseconds(5000);
   options.write_timeout = std::chrono::milliseconds(5000);
 
   // server

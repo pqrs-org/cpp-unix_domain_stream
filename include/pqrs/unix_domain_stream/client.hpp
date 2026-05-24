@@ -10,6 +10,7 @@
 #include "impl/peer.hpp"
 #include "options.hpp"
 #include "peer_credentials.hpp"
+#include <atomic>
 #include <filesystem>
 #include <nod/nod.hpp>
 #include <pqrs/dispatcher.hpp>
@@ -59,6 +60,7 @@ public:
 
   void async_start() {
     enqueue_to_dispatcher([this] {
+      stopped_ = false;
       connect();
     });
   }
@@ -79,7 +81,7 @@ public:
 
 private:
   void stop() {
-    options_.reconnect_interval = std::nullopt;
+    stopped_ = true;
     reconnect_timer_.stop();
 
     asio::post(io_ctx_, [this] {
@@ -92,7 +94,8 @@ private:
 
   void connect() {
     asio::post(io_ctx_, [this] {
-      if (peer_) {
+      if (stopped_ ||
+          peer_) {
         return;
       }
 
@@ -101,6 +104,12 @@ private:
       socket->async_connect(
           asio::local::stream_protocol::endpoint(socket_file_path_),
           [this, socket](auto&& error_code) mutable {
+            if (stopped_) {
+              asio::error_code close_error_code;
+              socket->close(close_error_code);
+              return;
+            }
+
             if (error_code) {
               enqueue_to_dispatcher([this, error_code] {
                 connect_failed(error_code);
@@ -148,18 +157,21 @@ private:
   }
 
   void start_reconnect_timer() {
-    if (options_.reconnect_interval) {
-      reconnect_timer_.start(
-          [this] {
-            connect();
-          },
-          *options_.reconnect_interval);
+    if (stopped_) {
+      return;
     }
+
+    reconnect_timer_.start(
+        [this] {
+          connect();
+        },
+        options_.reconnect_interval);
   }
 
   std::filesystem::path socket_file_path_;
   options options_;
   dispatcher::extra::timer reconnect_timer_;
+  std::atomic_bool stopped_ = true;
 
   asio::io_context io_ctx_;
   asio::executor_work_guard<asio::io_context::executor_type> work_guard_;

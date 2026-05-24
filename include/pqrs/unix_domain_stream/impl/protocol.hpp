@@ -14,6 +14,8 @@ namespace pqrs::unix_domain_stream::impl::protocol {
 enum class message_type : uint8_t {
   heartbeat,
   user_data,
+  health_check,
+  health_check_response,
 };
 
 constexpr size_t header_size = sizeof(uint32_t);
@@ -58,6 +60,24 @@ inline std::vector<uint8_t> make_user_data_frame(const std::vector<uint8_t>& dat
   return make_frame(message_type::user_data,
                     data.data(),
                     data.size());
+}
+
+inline std::vector<uint8_t> make_heartbeat_frame() {
+  return make_frame(message_type::heartbeat,
+                    nullptr,
+                    0);
+}
+
+inline std::vector<uint8_t> make_health_check_frame() {
+  return make_frame(message_type::health_check,
+                    nullptr,
+                    0);
+}
+
+inline std::vector<uint8_t> make_health_check_response_frame() {
+  return make_frame(message_type::health_check_response,
+                    nullptr,
+                    0);
 }
 
 } // namespace pqrs::unix_domain_stream::impl::protocol

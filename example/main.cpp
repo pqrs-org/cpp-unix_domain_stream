@@ -46,7 +46,10 @@ int main() {
   pqrs::unix_domain_stream::options options;
   options.max_message_size = 32 * 1024;
   options.max_send_queue_size = 128;
-  options.reconnect_interval = std::nullopt;
+  options.reconnect_interval = std::chrono::milliseconds(1000);
+  options.server_check_interval = std::chrono::milliseconds(3000);
+  options.heartbeat_interval = std::chrono::milliseconds(3000);
+  options.heartbeat_timeout = std::chrono::milliseconds(10000);
   options.write_timeout = std::chrono::milliseconds(5000);
 
   // server

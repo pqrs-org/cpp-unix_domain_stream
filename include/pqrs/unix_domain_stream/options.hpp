@@ -24,6 +24,24 @@ struct options final {
   // Set to std::nullopt to disable automatic reconnect/rebind attempts.
   std::optional<std::chrono::milliseconds> reconnect_interval = std::chrono::milliseconds(1000);
 
+  // Interval used by the server to verify that its socket path is still
+  // connectable and that the accepted connection can exchange an internal
+  // health-check frame.
+  // Set to std::nullopt to disable server health checks.
+  std::optional<std::chrono::milliseconds> server_check_interval = std::nullopt;
+
+  // Maximum time allowed for one server health check.
+  std::chrono::milliseconds server_check_timeout = std::chrono::milliseconds(1000);
+
+  // Interval used to send heartbeat frames to the peer.
+  // Set to std::nullopt to disable heartbeat sending.
+  std::optional<std::chrono::milliseconds> heartbeat_interval = std::nullopt;
+
+  // Maximum idle time allowed without receiving any frame from the peer.
+  // Heartbeat, health-check and user-data frames all refresh this deadline.
+  // Set to std::nullopt to disable heartbeat timeout checks.
+  std::optional<std::chrono::milliseconds> heartbeat_timeout = std::nullopt;
+
   // Maximum time allowed for one async write operation.
   // Set to std::nullopt to disable write timeouts.
   std::optional<std::chrono::milliseconds> write_timeout = std::chrono::milliseconds(5000);

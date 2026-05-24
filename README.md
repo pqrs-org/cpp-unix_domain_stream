@@ -12,7 +12,9 @@ Unix domain stream socket server and client.
 - Server manages each connected client by `pqrs::unix_domain_stream::peer_id`.
 - Server can verify peer credentials before accepting a connection.
 - Server will rebind automatically when bind or accept fails if `options::reconnect_interval` is set.
+- Server can periodically self-connect and exchange an internal health-check frame if `options::server_check_interval` is set. This detects cases such as the socket file being removed.
 - Client will reconnect automatically when connect fails or the connection is closed if `options::reconnect_interval` is set.
+- Peers can periodically exchange heartbeat frames if `options::heartbeat_interval` is set, and close idle connections if `options::heartbeat_timeout` is exceeded.
 
 ## Requirements
 

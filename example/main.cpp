@@ -43,15 +43,10 @@ int main() {
   std::error_code error_code;
   std::filesystem::create_directories(server_socket_file_path.parent_path(), error_code);
 
-  pqrs::unix_domain_stream::options options;
-  options.max_message_size = 32 * 1024;
-  options.max_send_queue_size = 128;
-  options.reconnect_interval = std::chrono::milliseconds(1000);
-  options.server_check_interval = std::chrono::milliseconds(3000);
-  options.heartbeat_interval = std::chrono::milliseconds(3000);
-  options.heartbeat_timeout = std::chrono::milliseconds(10000);
-  options.read_timeout = std::chrono::milliseconds(5000);
-  options.write_timeout = std::chrono::milliseconds(5000);
+  pqrs::unix_domain_stream::options options(
+      pqrs::unix_domain_stream::options::initialization_parameters{
+          .max_send_queue_size = 128,
+      });
 
   // server
 

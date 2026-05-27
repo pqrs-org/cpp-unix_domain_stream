@@ -1,6 +1,7 @@
 #include <array>
 #include <atomic>
 #include <boost/ut.hpp>
+#include <future>
 #include <iostream>
 #include <pqrs/unix_domain_stream.hpp>
 #include <thread>
@@ -8,6 +9,8 @@
 namespace {
 
 const std::filesystem::path server_socket_file_path("tmp/server.sock");
+
+using async_request_test_result = std::pair<asio::error_code, std::shared_ptr<std::vector<uint8_t>>>;
 
 pqrs::unix_domain_stream::options make_options() {
   return pqrs::unix_domain_stream::options(
@@ -180,8 +183,19 @@ int main() {
     client->async_start();
     expect(wait_until([&] { return client_connected.load(); }));
 
-    auto future1 = client->async_request(std::vector<uint8_t>{1});
-    auto future2 = client->async_request(std::vector<uint8_t>{2});
+    std::promise<async_request_test_result> promise1;
+    std::promise<async_request_test_result> promise2;
+    auto future1 = promise1.get_future();
+    auto future2 = promise2.get_future();
+
+    client->async_request(std::vector<uint8_t>{1},
+                          [&promise1](const auto& error_code, auto response) {
+                            promise1.set_value({error_code, response});
+                          });
+    client->async_request(std::vector<uint8_t>{2},
+                          [&promise2](const auto& error_code, auto response) {
+                            promise2.set_value({error_code, response});
+                          });
 
     expect(future1.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
     expect(future2.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
@@ -237,8 +251,14 @@ int main() {
     client->async_start();
     expect(wait_until([&] { return client_connected.load(); }));
 
-    auto future = client->async_request(std::vector<uint8_t>{1},
-                                        std::chrono::milliseconds(100));
+    std::promise<async_request_test_result> promise;
+    auto future = promise.get_future();
+
+    client->async_request(std::vector<uint8_t>{1},
+                          std::chrono::milliseconds(100),
+                          [&promise](const auto& error_code, auto response) {
+                            promise.set_value({error_code, response});
+                          });
 
     expect(future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
 

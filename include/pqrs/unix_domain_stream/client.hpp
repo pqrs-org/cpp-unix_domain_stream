@@ -14,7 +14,6 @@
 #include <atomic>
 #include <filesystem>
 #include <functional>
-#include <future>
 #include <memory>
 #include <nod/nod.hpp>
 #include <pqrs/dispatcher.hpp>
@@ -31,7 +30,6 @@ public:
   nod::signal<void(const asio::error_code&)> error_occurred;
   nod::signal<void(not_null_shared_ptr_t<std::vector<uint8_t>>)> received;
 
-  using async_request_result = std::pair<asio::error_code, std::shared_ptr<std::vector<uint8_t>>>;
   using async_request_callback = std::function<void(const asio::error_code&,
                                                     std::shared_ptr<std::vector<uint8_t>>)>;
 
@@ -87,24 +85,6 @@ public:
         peer_->async_send(data);
       }
     });
-  }
-
-  std::future<async_request_result> async_request(const std::vector<uint8_t>& data) {
-    return async_request(data, options_.read_timeout);
-  }
-
-  std::future<async_request_result> async_request(const std::vector<uint8_t>& data,
-                                                  std::chrono::milliseconds timeout) {
-    auto promise = std::make_shared<std::promise<async_request_result>>();
-    auto future = promise->get_future();
-
-    async_request(data,
-                  timeout,
-                  [promise](const auto& error_code, auto response) {
-                    promise->set_value({error_code, response});
-                  });
-
-    return future;
   }
 
   void async_request(const std::vector<uint8_t>& data,

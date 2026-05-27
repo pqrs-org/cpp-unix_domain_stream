@@ -203,6 +203,58 @@ int main() {
     dispatcher = nullptr;
   };
 
+  "unix_domain_stream::client_async_request_timeout"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::client_async_request_timeout)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto options = make_options();
+    std::atomic_bool server_bound = false;
+    std::atomic_bool client_connected = false;
+    std::atomic_size_t server_request_received_count = 0;
+
+    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
+                                                                     server_socket_file_path,
+                                                                     options);
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+    server->request_received.connect([&](auto, auto, auto&&) {
+      ++server_request_received_count;
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+
+    auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
+                                                                     server_socket_file_path,
+                                                                     options);
+    client->connected.connect([&](auto&&) {
+      client_connected = true;
+    });
+    client->async_start();
+    expect(wait_until([&] { return client_connected.load(); }));
+
+    auto future = client->async_request(std::vector<uint8_t>{1},
+                                        std::chrono::milliseconds(100));
+
+    expect(future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
+
+    auto [error_code, response] = future.get();
+
+    expect(error_code == asio::error::timed_out);
+    expect(response == nullptr);
+    expect(server_request_received_count.load() == 1);
+
+    client = nullptr;
+    server = nullptr;
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
   "unix_domain_stream::client_reconnect"_test = [] {
     std::cout << "TEST_CASE(unix_domain_stream::client_reconnect)" << std::endl;
 

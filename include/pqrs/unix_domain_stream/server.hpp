@@ -10,16 +10,16 @@
 #include "impl/peer.hpp"
 #include "options.hpp"
 #include "peer_credentials.hpp"
+#include "types.hpp"
 #include <atomic>
 #include <filesystem>
 #include <nod/nod.hpp>
 #include <pqrs/dispatcher.hpp>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace pqrs::unix_domain_stream {
-
-using peer_id = uint64_t;
 
 inline bool default_verify_peer(const peer_credentials&) {
   return true;
@@ -34,6 +34,7 @@ public:
   nod::signal<void(peer_id)> peer_closed;
   nod::signal<void(peer_id, const asio::error_code&)> peer_error_occurred;
   nod::signal<void(peer_id, not_null_shared_ptr_t<std::vector<uint8_t>>)> received;
+  nod::signal<void(peer_id, request_id, not_null_shared_ptr_t<std::vector<uint8_t>>)> request_received;
 
   server(const server&) = delete;
 
@@ -88,6 +89,17 @@ public:
       if (auto it = peers_.find(id);
           it != std::end(peers_)) {
         it->second->async_send(data);
+      }
+    });
+  }
+
+  void async_respond(peer_id id,
+                     request_id request_id_value,
+                     const std::vector<uint8_t>& data) {
+    asio::post(io_ctx_, [this, id, request_id_value, data] {
+      if (auto it = peers_.find(id);
+          it != std::end(peers_)) {
+        it->second->async_send_response(request_id_value, data);
       }
     });
   }
@@ -217,6 +229,12 @@ private:
           p->received.connect([this, id](auto&& buffer) {
             enqueue_to_dispatcher([this, id, buffer] {
               received(id, buffer);
+            });
+          });
+
+          p->request_received.connect([this, id](auto request_id, auto&& buffer) {
+            enqueue_to_dispatcher([this, id, request_id, buffer] {
+              request_received(id, request_id, buffer);
             });
           });
 

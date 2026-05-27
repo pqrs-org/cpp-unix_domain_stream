@@ -7,6 +7,7 @@
 #include "../options.hpp"
 #include "asio_helper.hpp"
 #include "protocol.hpp"
+#include <algorithm>
 #include <deque>
 #include <nod/nod.hpp>
 #include <pqrs/dispatcher.hpp>
@@ -19,6 +20,8 @@ class peer final : public dispatcher::extra::dispatcher_client,
 public:
   nod::signal<void()> ready;
   nod::signal<void(not_null_shared_ptr_t<std::vector<uint8_t>>)> received;
+  nod::signal<void(uint64_t, not_null_shared_ptr_t<std::vector<uint8_t>>)> request_received;
+  nod::signal<void(uint64_t, not_null_shared_ptr_t<std::vector<uint8_t>>)> response_received;
   nod::signal<void()> health_check_response_received;
   nod::signal<void(const asio::error_code&)> error_occurred;
   nod::signal<void()> closed;
@@ -63,6 +66,24 @@ public:
 
   void async_send(const std::vector<uint8_t>& data) {
     auto frame = protocol::make_user_data_frame(data);
+
+    asio::post(socket_.get_executor(), [self = shared_from_this(), frame = std::move(frame)] {
+      self->push_frame(frame);
+    });
+  }
+
+  void async_send_request(uint64_t request_id,
+                          const std::vector<uint8_t>& data) {
+    auto frame = protocol::make_request_frame(request_id, data);
+
+    asio::post(socket_.get_executor(), [self = shared_from_this(), frame = std::move(frame)] {
+      self->push_frame(frame);
+    });
+  }
+
+  void async_send_response(uint64_t request_id,
+                           const std::vector<uint8_t>& data) {
+    auto frame = protocol::make_response_frame(request_id, data);
 
     asio::post(socket_.get_executor(), [self = shared_from_this(), frame = std::move(frame)] {
       self->push_frame(frame);
@@ -155,7 +176,7 @@ private:
 
                        auto body_size = protocol::decode_uint32(self->read_header_);
                        if (body_size < protocol::type_size ||
-                           body_size > self->options_.max_message_size + protocol::type_size) {
+                           body_size > self->options_.max_message_size + protocol::type_size + protocol::request_id_size) {
                          self->handle_error(asio::error::message_size);
                          return;
                        }
@@ -195,11 +216,43 @@ private:
                          case protocol::message_type::user_data: {
                            self->ensure_ready();
 
+                           if (self->read_body_.size() > self->options_.max_message_size + protocol::type_size) {
+                             self->handle_error(asio::error::message_size);
+                             return;
+                           }
+
                            auto v = std::make_shared<std::vector<uint8_t>>(std::begin(self->read_body_) + protocol::type_size,
                                                                            std::end(self->read_body_));
                            self->enqueue_to_dispatcher([self, v] {
                              self->received(v);
                            });
+                           break;
+                         }
+
+                         case protocol::message_type::request:
+                         case protocol::message_type::response: {
+                           self->ensure_ready();
+
+                           if (self->read_body_.size() < protocol::type_size + protocol::request_id_size ||
+                               self->read_body_.size() > self->options_.max_message_size + protocol::type_size + protocol::request_id_size) {
+                             self->handle_error(asio::error::message_size);
+                             return;
+                           }
+
+                           auto request_id = protocol::decode_uint64(self->read_body_,
+                                                                     protocol::type_size);
+                           auto v = std::make_shared<std::vector<uint8_t>>(std::begin(self->read_body_) + protocol::type_size + protocol::request_id_size,
+                                                                           std::end(self->read_body_));
+
+                           if (type == protocol::message_type::request) {
+                             self->enqueue_to_dispatcher([self, request_id, v] {
+                               self->request_received(request_id, v);
+                             });
+                           } else {
+                             self->enqueue_to_dispatcher([self, request_id, v] {
+                               self->response_received(request_id, v);
+                             });
+                           }
                            break;
                          }
 
@@ -239,7 +292,7 @@ private:
       return;
     }
 
-    if (frame.size() > options_.max_message_size + protocol::header_size + protocol::type_size ||
+    if (!valid_outgoing_frame(frame) ||
         write_queue_.size() >= options_.max_send_queue_size) {
       handle_error(asio::error::no_buffer_space);
       return;
@@ -251,6 +304,37 @@ private:
     if (was_empty) {
       write();
     }
+  }
+
+  bool valid_outgoing_frame(const std::vector<uint8_t>& frame) const {
+    if (frame.size() < protocol::header_size + protocol::type_size) {
+      return false;
+    }
+
+    std::array<uint8_t, protocol::header_size> header;
+    std::copy_n(std::begin(frame), protocol::header_size, std::begin(header));
+
+    auto body_size = protocol::decode_uint32(header);
+    if (frame.size() != protocol::header_size + body_size ||
+        body_size < protocol::type_size) {
+      return false;
+    }
+
+    auto type = static_cast<protocol::message_type>(frame[protocol::header_size]);
+    switch (type) {
+      case protocol::message_type::request:
+      case protocol::message_type::response:
+        return body_size >= protocol::type_size + protocol::request_id_size &&
+               body_size <= options_.max_message_size + protocol::type_size + protocol::request_id_size;
+
+      case protocol::message_type::heartbeat:
+      case protocol::message_type::user_data:
+      case protocol::message_type::health_check:
+      case protocol::message_type::health_check_response:
+        return body_size <= options_.max_message_size + protocol::type_size;
+    }
+
+    return false;
   }
 
   void write() {

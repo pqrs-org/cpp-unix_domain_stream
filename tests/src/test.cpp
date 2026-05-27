@@ -1,5 +1,5 @@
-#include <atomic>
 #include <array>
+#include <atomic>
 #include <boost/ut.hpp>
 #include <iostream>
 #include <pqrs/unix_domain_stream.hpp>
@@ -129,6 +129,72 @@ int main() {
     expect(connected_peer_id.load() > 0);
     expect(server_received_count.load() == 32);
     expect(client_received_count.load() == 32);
+
+    client = nullptr;
+    server = nullptr;
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
+  "unix_domain_stream::client_async_request"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::client_async_request)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto options = make_options();
+    std::atomic_bool server_bound = false;
+    std::atomic_bool client_connected = false;
+
+    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
+                                                                     server_socket_file_path,
+                                                                     options);
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+
+    pqrs::unix_domain_stream::peer_id first_peer_id = 0;
+    pqrs::unix_domain_stream::request_id first_request_id = 0;
+    server->request_received.connect([&](auto peer_id, auto request_id, auto&& buffer) {
+      if (buffer->at(0) == 1) {
+        first_peer_id = peer_id;
+        first_request_id = request_id;
+        return;
+      }
+
+      server->async_respond(peer_id, request_id, std::vector<uint8_t>{20});
+      server->async_respond(first_peer_id, first_request_id, std::vector<uint8_t>{10});
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+
+    auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
+                                                                     server_socket_file_path,
+                                                                     options);
+    client->connected.connect([&](auto&&) {
+      client_connected = true;
+    });
+    client->async_start();
+    expect(wait_until([&] { return client_connected.load(); }));
+
+    auto future1 = client->async_request(std::vector<uint8_t>{1});
+    auto future2 = client->async_request(std::vector<uint8_t>{2});
+
+    expect(future1.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
+    expect(future2.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
+
+    auto [error_code1, response1] = future1.get();
+    auto [error_code2, response2] = future2.get();
+
+    expect(!error_code1);
+    expect(!error_code2);
+    expect(response1 != nullptr);
+    expect(response2 != nullptr);
+    expect(*response1 == std::vector<uint8_t>{10});
+    expect(*response2 == std::vector<uint8_t>{20});
 
     client = nullptr;
     server = nullptr;

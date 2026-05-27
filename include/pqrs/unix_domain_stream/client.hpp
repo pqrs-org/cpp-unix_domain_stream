@@ -10,10 +10,16 @@
 #include "impl/peer.hpp"
 #include "options.hpp"
 #include "peer_credentials.hpp"
+#include "types.hpp"
 #include <atomic>
 #include <filesystem>
+#include <functional>
+#include <future>
+#include <memory>
 #include <nod/nod.hpp>
 #include <pqrs/dispatcher.hpp>
+#include <unordered_map>
+#include <vector>
 
 namespace pqrs::unix_domain_stream {
 
@@ -24,6 +30,10 @@ public:
   nod::signal<void()> closed;
   nod::signal<void(const asio::error_code&)> error_occurred;
   nod::signal<void(not_null_shared_ptr_t<std::vector<uint8_t>>)> received;
+
+  using async_request_result = std::pair<asio::error_code, std::shared_ptr<std::vector<uint8_t>>>;
+  using async_request_callback = std::function<void(const asio::error_code&,
+                                                    std::shared_ptr<std::vector<uint8_t>>)>;
 
   client(const client&) = delete;
 
@@ -79,12 +89,71 @@ public:
     });
   }
 
+  std::future<async_request_result> async_request(const std::vector<uint8_t>& data) {
+    return async_request(data, options_.read_timeout);
+  }
+
+  std::future<async_request_result> async_request(const std::vector<uint8_t>& data,
+                                                  std::chrono::milliseconds timeout) {
+    auto promise = std::make_shared<std::promise<async_request_result>>();
+    auto future = promise->get_future();
+
+    async_request(data,
+                  timeout,
+                  [promise](const auto& error_code, auto response) {
+                    promise->set_value({error_code, response});
+                  });
+
+    return future;
+  }
+
+  void async_request(const std::vector<uint8_t>& data,
+                     async_request_callback callback) {
+    async_request(data, options_.read_timeout, callback);
+  }
+
+  void async_request(const std::vector<uint8_t>& data,
+                     std::chrono::milliseconds timeout,
+                     async_request_callback callback) {
+    asio::post(io_ctx_, [this, data, timeout, callback] {
+      if (!peer_) {
+        enqueue_to_dispatcher([callback] {
+          callback(asio::error::not_connected, nullptr);
+        });
+        return;
+      }
+
+      auto id = ++next_request_id_;
+      auto timer = std::make_shared<asio::steady_timer>(io_ctx_);
+      timer->expires_after(timeout);
+      timer->async_wait([this, id](const auto& error_code) {
+        if (!error_code) {
+          complete_request(id, asio::error::timed_out, nullptr);
+        }
+      });
+
+      pending_requests_.emplace(id, pending_request{
+                                        .callback = callback,
+                                        .timer = timer,
+                                    });
+
+      peer_->async_send_request(id, data);
+    });
+  }
+
 private:
+  struct pending_request final {
+    async_request_callback callback;
+    std::shared_ptr<asio::steady_timer> timer;
+  };
+
   void stop() {
     stopped_ = true;
     reconnect_timer_.stop();
 
     asio::post(io_ctx_, [this] {
+      complete_all_requests(asio::error::operation_aborted);
+
       if (peer_) {
         peer_->async_close();
         peer_ = nullptr;
@@ -130,7 +199,17 @@ private:
               });
             });
 
+            peer_->response_received.connect([this](auto request_id, auto&& buffer) {
+              asio::post(io_ctx_, [this, request_id, buffer] {
+                complete_request(request_id, asio::error_code(), buffer);
+              });
+            });
+
             peer_->error_occurred.connect([this](auto&& error_code) {
+              asio::post(io_ctx_, [this, error_code] {
+                complete_all_requests(error_code);
+              });
+
               enqueue_to_dispatcher([this, error_code] {
                 error_occurred(error_code);
               });
@@ -138,6 +217,7 @@ private:
 
             peer_->closed.connect([this] {
               asio::post(io_ctx_, [this] {
+                complete_all_requests(asio::error::connection_reset);
                 peer_ = nullptr;
               });
 
@@ -168,6 +248,33 @@ private:
         options_.reconnect_interval);
   }
 
+  void complete_request(request_id id,
+                        const asio::error_code& error_code,
+                        std::shared_ptr<std::vector<uint8_t>> data) {
+    if (auto it = pending_requests_.find(id);
+        it != std::end(pending_requests_)) {
+      auto request = std::move(it->second);
+      pending_requests_.erase(it);
+
+      request.timer->cancel();
+      enqueue_to_dispatcher([request, error_code, data] {
+        request.callback(error_code, data);
+      });
+    }
+  }
+
+  void complete_all_requests(const asio::error_code& error_code) {
+    auto pending_requests = std::move(pending_requests_);
+    pending_requests_.clear();
+
+    for (auto&& [_, request] : pending_requests) {
+      request.timer->cancel();
+      enqueue_to_dispatcher([request, error_code] {
+        request.callback(error_code, nullptr);
+      });
+    }
+  }
+
   std::filesystem::path socket_file_path_;
   options options_;
   dispatcher::extra::timer reconnect_timer_;
@@ -177,6 +284,8 @@ private:
   asio::executor_work_guard<asio::io_context::executor_type> work_guard_;
   std::thread io_ctx_thread_;
   std::shared_ptr<impl::peer> peer_;
+  request_id next_request_id_ = 0;
+  std::unordered_map<request_id, pending_request> pending_requests_;
 };
 
 } // namespace pqrs::unix_domain_stream

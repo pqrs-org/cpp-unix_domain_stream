@@ -29,6 +29,22 @@ void output_peer_credentials(const pqrs::unix_domain_stream::peer_credentials& c
   std::cout << "peer_uid: " << credentials.uid.value_or(-1) << std::endl;
   std::cout << "peer_gid: " << credentials.gid.value_or(-1) << std::endl;
 }
+
+std::vector<uint8_t> make_buffer(const std::string& string) {
+  return std::vector<uint8_t>(std::begin(string), std::end(string));
+}
+
+void output_async_request_result(const std::string& label,
+                                 const asio::error_code& error_code,
+                                 std::shared_ptr<std::vector<uint8_t>> response) {
+  if (error_code) {
+    std::cout << label << " failed: " << error_code.message() << std::endl;
+    return;
+  }
+
+  std::cout << label << " response size:" << response->size() << std::endl;
+  output_received_data(response);
+}
 } // namespace
 
 int main() {
@@ -88,6 +104,14 @@ int main() {
 
     server->async_send(peer_id, *buffer);
   });
+  server->request_received.connect([&server](auto peer_id, auto request_id, auto&& buffer) {
+    std::cout << "server request_received peer_id:" << peer_id << " request_id:" << request_id << " size:" << buffer->size() << std::endl;
+    output_received_data(buffer);
+
+    auto response = make_buffer("response for ");
+    response.insert(std::end(response), std::begin(*buffer), std::end(*buffer));
+    server->async_respond(peer_id, request_id, response);
+  });
 
   client->connected.connect([&client, &initial_messages_sent](auto&& credentials) {
     std::cout << "client connected" << std::endl;
@@ -113,9 +137,17 @@ int main() {
       client->async_send(buffer);
     }
     {
-      std::string s = "Type control-c to quit.";
-      std::vector<uint8_t> buffer(std::begin(s), std::end(s));
-      client->async_send(buffer);
+      client->async_send(make_buffer("Type control-c to quit."));
+    }
+    {
+      client->async_request(make_buffer("request 1"),
+                            [](const auto& error_code, auto response) {
+                              output_async_request_result("client async_request 1", error_code, response);
+                            });
+      client->async_request(make_buffer("request 2"),
+                            [](const auto& error_code, auto response) {
+                              output_async_request_result("client async_request 2", error_code, response);
+                            });
     }
   });
   client->connect_failed.connect([](auto&& error_code) {

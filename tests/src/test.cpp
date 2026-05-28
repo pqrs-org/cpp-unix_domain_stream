@@ -140,6 +140,114 @@ int main() {
     dispatcher = nullptr;
   };
 
+  "unix_domain_stream::verify_peer_runs_on_dispatcher"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::verify_peer_runs_on_dispatcher)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    pqrs::unix_domain_stream::options options(
+        pqrs::unix_domain_stream::options::initialization_parameters{
+            .server_check_interval = std::chrono::milliseconds(60000),
+        });
+
+    std::atomic_bool server_bound = false;
+    std::atomic_bool client_connected = false;
+    std::atomic_bool verify_peer_called = false;
+    std::promise<std::thread::id> verify_peer_thread_id_promise;
+    std::promise<std::thread::id> peer_connected_thread_id_promise;
+
+    auto server = std::make_unique<pqrs::unix_domain_stream::server>(
+        dispatcher,
+        server_socket_file_path,
+        options,
+        [&](auto&&) {
+          if (!verify_peer_called.exchange(true)) {
+            verify_peer_thread_id_promise.set_value(std::this_thread::get_id());
+          }
+          return true;
+        });
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+    server->peer_connected.connect([&](auto, auto&&) {
+      peer_connected_thread_id_promise.set_value(std::this_thread::get_id());
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+
+    auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
+                                                                     server_socket_file_path,
+                                                                     options);
+    client->connected.connect([&](auto&&) {
+      client_connected = true;
+    });
+    client->async_start();
+    expect(wait_until([&] { return client_connected.load(); }));
+
+    auto verify_peer_thread_id_future = verify_peer_thread_id_promise.get_future();
+    auto peer_connected_thread_id_future = peer_connected_thread_id_promise.get_future();
+
+    expect(verify_peer_thread_id_future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
+    expect(peer_connected_thread_id_future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
+    expect(verify_peer_thread_id_future.get() == peer_connected_thread_id_future.get());
+
+    client = nullptr;
+    server = nullptr;
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
+  "unix_domain_stream::client_peer_verification_failed"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::client_peer_verification_failed)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto options = make_options();
+    std::atomic_bool server_bound = false;
+    std::atomic_bool client_connected = false;
+    std::atomic_size_t peer_verification_failed_count = 0;
+
+    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
+                                                                     server_socket_file_path,
+                                                                     options);
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+
+    auto client = std::make_unique<pqrs::unix_domain_stream::client>(
+        dispatcher,
+        server_socket_file_path,
+        options,
+        [](auto&&) {
+          return false;
+        });
+    client->connected.connect([&](auto&&) {
+      client_connected = true;
+    });
+    client->peer_verification_failed.connect([&](auto&&) {
+      ++peer_verification_failed_count;
+    });
+    client->async_start();
+
+    expect(wait_until([&] { return peer_verification_failed_count.load() >= 1; }));
+    expect(!client_connected.load());
+
+    client = nullptr;
+    server = nullptr;
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
   "unix_domain_stream::client_async_request"_test = [] {
     std::cout << "TEST_CASE(unix_domain_stream::client_async_request)" << std::endl;
 
@@ -390,10 +498,16 @@ int main() {
     std::atomic<size_t> closed_count = 0;
     std::atomic<size_t> peer_connected_count = 0;
     std::atomic<size_t> client_received_count = 0;
+    std::atomic<size_t> verify_peer_count = 0;
 
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    auto server = std::make_unique<pqrs::unix_domain_stream::server>(
+        dispatcher,
+        server_socket_file_path,
+        options,
+        [&](auto&&) {
+          ++verify_peer_count;
+          return true;
+        });
     server->bound.connect([&] {
       ++bound_count;
     });
@@ -412,6 +526,7 @@ int main() {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     expect(peer_connected_count.load() == 0);
+    expect(verify_peer_count.load() == 0);
 
     std::error_code error_code;
     std::filesystem::remove(server_socket_file_path, error_code);
@@ -437,6 +552,7 @@ int main() {
 
     expect(wait_until([&] { return client_received_count.load() == 16; }));
     expect(peer_connected_count.load() == 1);
+    expect(verify_peer_count.load() == 1);
 
     client = nullptr;
     server = nullptr;

@@ -66,9 +66,15 @@ int main() {
 
   // server
 
-  auto server = std::make_shared<pqrs::unix_domain_stream::server>(dispatcher,
-                                                                   server_socket_file_path,
-                                                                   options);
+  auto server = std::make_shared<pqrs::unix_domain_stream::server>(
+      dispatcher,
+      server_socket_file_path,
+      options,
+      [](const auto& credentials) {
+        std::cout << "server verify_peer" << std::endl;
+        output_peer_credentials(credentials);
+        return true;
+      });
 
   // client
 

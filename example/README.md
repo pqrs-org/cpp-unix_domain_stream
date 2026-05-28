@@ -14,6 +14,10 @@ client connected
 peer_pid: 92476
 peer_uid: 501
 peer_gid: 20
+server verify_peer
+peer_pid: 92476
+peer_uid: 501
+peer_gid: 20
 server peer_connected peer_id:1
 peer_pid: 92476
 peer_uid: 501

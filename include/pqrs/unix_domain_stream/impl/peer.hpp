@@ -30,13 +30,10 @@ public:
 
   peer(std::weak_ptr<dispatcher::dispatcher> weak_dispatcher,
        asio::local::stream_protocol::socket socket,
-       const options& options,
-       bool defer_ready = false)
+       const options& options)
       : dispatcher_client(weak_dispatcher),
         socket_(std::move(socket)),
         options_(options),
-        defer_ready_(defer_ready),
-        ready_(!defer_ready),
         ready_deadline_(socket_.get_executor()),
         heartbeat_timer_(socket_.get_executor()),
         heartbeat_deadline_(socket_.get_executor()),
@@ -124,10 +121,6 @@ private:
   }
 
   void start_ready_deadline() {
-    if (!defer_ready_) {
-      return;
-    }
-
     ready_deadline_.expires_after(std::chrono::milliseconds(100));
 
     auto self = shared_from_this();
@@ -210,7 +203,6 @@ private:
                        auto type = static_cast<protocol::message_type>(self->read_body_[0]);
                        switch (type) {
                          case protocol::message_type::heartbeat:
-                           self->ensure_ready();
                            break;
 
                          case protocol::message_type::user_data: {
@@ -412,8 +404,7 @@ private:
 
   asio::local::stream_protocol::socket socket_;
   options options_;
-  bool defer_ready_;
-  bool ready_;
+  bool ready_ = false;
   bool close_after_write_ = false;
   asio::steady_timer ready_deadline_;
   asio::steady_timer heartbeat_timer_;

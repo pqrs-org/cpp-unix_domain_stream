@@ -66,8 +66,8 @@ int main() {
             .write_timeout = std::chrono::milliseconds(890),
         });
 
-    expect(options.max_message_size == 123);
-    expect(options.max_send_queue_size == 456);
+    expect(options.max_message_size == 123_i);
+    expect(options.max_send_queue_size == 456_i);
     expect(options.reconnect_interval == std::chrono::milliseconds(789));
     expect(options.server_check_interval == std::chrono::milliseconds(234));
     expect(options.server_check_timeout == std::chrono::milliseconds(345));
@@ -131,11 +131,11 @@ int main() {
     data[2] = 30;
     client->async_send(data);
 
-    expect(wait_until([&] { return client_received_count.load() == 32; }));
+    expect(wait_until([&] { return client_received_count.load() == 32_i; }));
 
-    expect(connected_peer_id.load() > 0);
-    expect(server_received_count.load() == 32);
-    expect(client_received_count.load() == 32);
+    expect(connected_peer_id.load() > 0_i);
+    expect(server_received_count.load() == 32_i);
+    expect(client_received_count.load() == 32_i);
 
     client = nullptr;
     server = nullptr;
@@ -194,7 +194,7 @@ int main() {
     });
     client->async_start();
     expect(wait_until([&] { return client_connected.load(); }));
-    expect(wait_until([&] { return connected_peer_id.load() > 0; }));
+    expect(wait_until([&] { return connected_peer_id.load() > 0_i; }));
 
     // Unlinking the socket pathname should not affect the connected socket
     // descriptors held by the client and server.
@@ -206,8 +206,8 @@ int main() {
     // the established client -> server -> client echo path.
     client->async_send(std::vector<uint8_t>(24, 42));
 
-    expect(wait_until([&] { return client_received_count.load() == 24; }));
-    expect(server_received_count.load() == 24);
+    expect(wait_until([&] { return client_received_count.load() == 24_i; }));
+    expect(server_received_count.load() == 24_i);
 
     client = nullptr;
     server = nullptr;
@@ -341,12 +341,12 @@ int main() {
     asio::write(rejected_socket, asio::buffer(user_data_frame));
     asio::write(rejected_socket, asio::buffer(request_frame));
 
-    expect(wait_until([&] { return verify_peer_count.load() == 1; }));
+    expect(wait_until([&] { return verify_peer_count.load() == 1_i; }));
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-    expect(peer_connected_count.load() == 0);
-    expect(server_received_count.load() == 0);
-    expect(server_request_received_count.load() == 0);
+    expect(peer_connected_count.load() == 0_i);
+    expect(server_received_count.load() == 0_i);
+    expect(server_request_received_count.load() == 0_i);
 
     asio::error_code close_error_code;
     rejected_socket.close(close_error_code);
@@ -356,14 +356,14 @@ int main() {
     asio::local::stream_protocol::socket accepted_socket(io_ctx);
     accepted_socket.connect(asio::local::stream_protocol::endpoint(server_socket_file_path));
 
-    expect(wait_until([&] { return peer_connected_count.load() == 1; }));
-    expect(verify_peer_count.load() == 2);
+    expect(wait_until([&] { return peer_connected_count.load() == 1_i; }));
+    expect(verify_peer_count.load() == 2_i);
 
     asio::write(accepted_socket, asio::buffer(user_data_frame));
     asio::write(accepted_socket, asio::buffer(request_frame));
 
-    expect(wait_until([&] { return server_received_count.load() == 3; }));
-    expect(wait_until([&] { return server_request_received_count.load() == 1; }));
+    expect(wait_until([&] { return server_received_count.load() == 3_i; }));
+    expect(wait_until([&] { return server_request_received_count.load() == 1_i; }));
 
     accepted_socket.close(close_error_code);
 
@@ -412,7 +412,7 @@ int main() {
     client->async_start();
 
     // A rejected server peer should notify failure and never publish connected.
-    expect(wait_until([&] { return peer_verification_failed_count.load() >= 1; }));
+    expect(wait_until([&] { return peer_verification_failed_count.load() >= 1_i; }));
     expect(!client_connected.load());
 
     client = nullptr;
@@ -555,7 +555,7 @@ int main() {
     // Timeout is local to the pending request; the server still saw the request.
     expect(error_code == asio::error::timed_out);
     expect(response == nullptr);
-    expect(server_request_received_count.load() == 1);
+    expect(server_request_received_count.load() == 1_i);
 
     client = nullptr;
     server = nullptr;
@@ -586,7 +586,7 @@ int main() {
     client->async_start();
 
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    expect(connected_count.load() == 0);
+    expect(connected_count.load() == 0_i);
 
     // After the server appears, the reconnect timer should establish exactly one connection.
     std::atomic_bool server_bound = false;
@@ -599,8 +599,8 @@ int main() {
     server->async_start();
     expect(wait_until([&] { return server_bound.load(); }));
 
-    expect(wait_until([&] { return connected_count.load() == 1; }));
-    expect(connected_count.load() == 1);
+    expect(wait_until([&] { return connected_count.load() == 1_i; }));
+    expect(connected_count.load() == 1_i);
 
     client = nullptr;
     server = nullptr;
@@ -708,18 +708,18 @@ int main() {
     });
     server->async_start();
 
-    expect(wait_until([&] { return bound_count.load() == 1; }));
+    expect(wait_until([&] { return bound_count.load() == 1_i; }));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    expect(peer_connected_count.load() == 0);
-    expect(verify_peer_count.load() == 0);
+    expect(peer_connected_count.load() == 0_i);
+    expect(verify_peer_count.load() == 0_i);
 
     // Remove the socket file to force the periodic health check to fail and rebind.
     std::error_code error_code;
     std::filesystem::remove(server_socket_file_path, error_code);
 
-    expect(wait_until([&] { return closed_count.load() >= 1; }));
-    expect(wait_until([&] { return bound_count.load() >= 2; }));
+    expect(wait_until([&] { return closed_count.load() >= 1_i; }));
+    expect(wait_until([&] { return bound_count.load() >= 2_i; }));
 
     // After rebinding, a real client should still connect and exchange data.
     std::atomic_bool client_connected = false;
@@ -738,9 +738,9 @@ int main() {
 
     client->async_send(std::vector<uint8_t>(16, 42));
 
-    expect(wait_until([&] { return client_received_count.load() == 16; }));
-    expect(peer_connected_count.load() == 1);
-    expect(verify_peer_count.load() == 1);
+    expect(wait_until([&] { return client_received_count.load() == 16_i; }));
+    expect(peer_connected_count.load() == 1_i);
+    expect(verify_peer_count.load() == 1_i);
 
     client = nullptr;
     server = nullptr;
@@ -896,7 +896,7 @@ int main() {
         .expected_peer_connected_count = 1,
         .expected_peer_closed_count = 1,
     });
-    expect(message_size_error_count.load() == 1);
+    expect(message_size_error_count.load() == 1_i);
 
     // The declared body size must fit within the configured payload limit.
     // This rejects oversized frames before allocating a matching read buffer.
@@ -909,7 +909,7 @@ int main() {
         .expected_peer_connected_count = 2,
         .expected_peer_closed_count = 2,
     });
-    expect(message_size_error_count.load() == 2);
+    expect(message_size_error_count.load() == 2_i);
 
     // Request and response frames must include the request_id field.
     // A body containing only the type byte is structurally invalid for them.
@@ -920,7 +920,7 @@ int main() {
         .expected_peer_connected_count = 3,
         .expected_peer_closed_count = 3,
     });
-    expect(message_size_error_count.load() == 3);
+    expect(message_size_error_count.load() == 3_i);
 
     send_malformed_frame({
         .frame = make_raw_frame(
@@ -929,7 +929,7 @@ int main() {
         .expected_peer_connected_count = 4,
         .expected_peer_closed_count = 4,
     });
-    expect(message_size_error_count.load() == 4);
+    expect(message_size_error_count.load() == 4_i);
 
     // Unknown message types are protocol errors.
     // They should not be ignored and treated as an empty valid frame.
@@ -938,7 +938,7 @@ int main() {
         .expected_peer_connected_count = 5,
         .expected_peer_closed_count = 5,
     });
-    expect(invalid_argument_error_count.load() == 1);
+    expect(invalid_argument_error_count.load() == 1_i);
 
     server = nullptr;
 
@@ -1060,9 +1060,9 @@ int main() {
 
     client->async_send(std::vector<uint8_t>(16, 42));
 
-    expect(wait_until([&] { return client_received_count.load() == 16; }));
-    expect(server_received_count.load() == 16);
-    expect(client_received_count.load() == 16);
+    expect(wait_until([&] { return client_received_count.load() == 16_i; }));
+    expect(server_received_count.load() == 16_i);
+    expect(client_received_count.load() == 16_i);
 
     client = nullptr;
     server = nullptr;

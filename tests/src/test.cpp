@@ -3,8 +3,8 @@
 #include <boost/ut.hpp>
 #include <future>
 #include <iostream>
-#include <pqrs/unix_domain_stream/impl/protocol.hpp>
 #include <pqrs/unix_domain_stream.hpp>
+#include <pqrs/unix_domain_stream/impl/protocol.hpp>
 #include <thread>
 
 namespace {
@@ -799,6 +799,146 @@ int main() {
 
     asio::error_code error_code;
     socket.close(error_code);
+
+    server = nullptr;
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
+  "unix_domain_stream::malformed_frame"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::malformed_frame)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto options = pqrs::unix_domain_stream::options(
+        pqrs::unix_domain_stream::options::initialization_parameters{
+            .max_message_size = 8,
+            .max_send_queue_size = 128,
+            .reconnect_interval = std::chrono::milliseconds(100),
+            .read_timeout = std::chrono::milliseconds(1000),
+            .write_timeout = std::chrono::milliseconds(1000),
+        });
+
+    std::atomic_bool server_bound = false;
+    std::atomic_size_t peer_connected_count = 0;
+    std::atomic_size_t peer_closed_count = 0;
+    std::atomic_size_t message_size_error_count = 0;
+    std::atomic_size_t invalid_argument_error_count = 0;
+
+    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
+                                                                     server_socket_file_path,
+                                                                     options);
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+    server->peer_connected.connect([&](auto, auto&&) {
+      ++peer_connected_count;
+    });
+    server->peer_error_occurred.connect([&](auto, auto&& error_code) {
+      if (error_code == asio::error::message_size) {
+        ++message_size_error_count;
+      } else if (error_code == asio::error::invalid_argument) {
+        ++invalid_argument_error_count;
+      }
+    });
+    server->peer_closed.connect([&](auto) {
+      ++peer_closed_count;
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+
+    auto make_raw_frame = [](uint32_t body_size,
+                             const std::vector<uint8_t>& body) {
+      // Build intentionally malformed frames without using protocol helpers,
+      // since those helpers always produce internally consistent frames.
+      std::array<uint8_t, pqrs::unix_domain_stream::impl::protocol::header_size> header;
+      pqrs::unix_domain_stream::impl::protocol::encode_uint32(header, body_size);
+
+      std::vector<uint8_t> frame;
+      frame.insert(frame.end(), header.begin(), header.end());
+      frame.insert(frame.end(), body.begin(), body.end());
+      return frame;
+    };
+
+    struct send_malformed_frame_parameters final {
+      std::vector<uint8_t> frame;
+      size_t expected_peer_connected_count;
+      size_t expected_peer_closed_count;
+    };
+
+    auto send_malformed_frame = [&](send_malformed_frame_parameters parameters) {
+      // Use a fresh raw connection for each malformed frame. A protocol error
+      // closes the peer, so later cases need their own connection.
+      asio::io_context io_ctx;
+      asio::local::stream_protocol::socket socket(io_ctx);
+      socket.connect(asio::local::stream_protocol::endpoint(server_socket_file_path));
+
+      // Wait until the server has exposed this peer. Otherwise an immediate
+      // protocol error would be intentionally hidden from public peer signals.
+      expect(wait_until([&] { return peer_connected_count.load() == parameters.expected_peer_connected_count; }));
+
+      asio::write(socket, asio::buffer(parameters.frame));
+
+      expect(wait_until([&] { return peer_closed_count.load() == parameters.expected_peer_closed_count; }));
+
+      asio::error_code error_code;
+      socket.close(error_code);
+    };
+
+    // The declared body size must at least contain the message type byte.
+    // Otherwise the receiver cannot even decide how to parse the body.
+    send_malformed_frame({
+        .frame = make_raw_frame(0, {}),
+        .expected_peer_connected_count = 1,
+        .expected_peer_closed_count = 1,
+    });
+    expect(message_size_error_count.load() == 1);
+
+    // The declared body size must fit within the configured payload limit.
+    // This rejects oversized frames before allocating a matching read buffer.
+    send_malformed_frame({
+        .frame = make_raw_frame(options.max_message_size +
+                                    pqrs::unix_domain_stream::impl::protocol::type_size +
+                                    pqrs::unix_domain_stream::impl::protocol::request_id_size +
+                                    1,
+                                {}),
+        .expected_peer_connected_count = 2,
+        .expected_peer_closed_count = 2,
+    });
+    expect(message_size_error_count.load() == 2);
+
+    // Request and response frames must include the request_id field.
+    // A body containing only the type byte is structurally invalid for them.
+    send_malformed_frame({
+        .frame = make_raw_frame(
+            pqrs::unix_domain_stream::impl::protocol::type_size,
+            {static_cast<uint8_t>(pqrs::unix_domain_stream::impl::protocol::message_type::request)}),
+        .expected_peer_connected_count = 3,
+        .expected_peer_closed_count = 3,
+    });
+    expect(message_size_error_count.load() == 3);
+
+    send_malformed_frame({
+        .frame = make_raw_frame(
+            pqrs::unix_domain_stream::impl::protocol::type_size,
+            {static_cast<uint8_t>(pqrs::unix_domain_stream::impl::protocol::message_type::response)}),
+        .expected_peer_connected_count = 4,
+        .expected_peer_closed_count = 4,
+    });
+    expect(message_size_error_count.load() == 4);
+
+    // Unknown message types are protocol errors.
+    // They should not be ignored and treated as an empty valid frame.
+    send_malformed_frame({
+        .frame = make_raw_frame(1, {0xff}),
+        .expected_peer_connected_count = 5,
+        .expected_peer_closed_count = 5,
+    });
+    expect(invalid_argument_error_count.load() == 1);
 
     server = nullptr;
 

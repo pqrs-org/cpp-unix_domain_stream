@@ -262,6 +262,10 @@ private:
                              self->health_check_response_received();
                            });
                            break;
+
+                         default:
+                           self->handle_error(asio::error::invalid_argument);
+                           return;
                        }
 
                        self->read_header();

@@ -1,4 +1,5 @@
 #include <array>
+#include <asio/local/connect_pair.hpp>
 #include <atomic>
 #include <boost/ut.hpp>
 #include <future>
@@ -417,6 +418,66 @@ int main() {
 
     client = nullptr;
     server = nullptr;
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
+  "unix_domain_stream::peer_dispatcher_callbacks_do_not_keep_peer_alive"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::peer_dispatcher_callbacks_do_not_keep_peer_alive)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    asio::io_context io_ctx;
+    auto work_guard = asio::make_work_guard(io_ctx);
+    std::thread io_ctx_thread([&] {
+      io_ctx.run();
+    });
+
+    asio::local::stream_protocol::socket peer_socket(io_ctx);
+    asio::local::stream_protocol::socket raw_socket(io_ctx);
+    asio::local::connect_pair(peer_socket, raw_socket);
+
+    pqrs::dispatcher::extra::dispatcher_client blocker(dispatcher);
+    std::promise<void> blocker_started_promise;
+    auto blocker_started_future = blocker_started_promise.get_future();
+    std::promise<void> unblock_promise;
+    auto unblock_future = unblock_promise.get_future().share();
+
+    blocker.enqueue_to_dispatcher([&] {
+      blocker_started_promise.set_value();
+      unblock_future.wait();
+    });
+    expect(blocker_started_future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
+
+    auto options = make_options();
+    auto peer = std::make_shared<pqrs::unix_domain_stream::impl::peer>(dispatcher,
+                                                                       std::move(peer_socket),
+                                                                       options);
+    std::weak_ptr<pqrs::unix_domain_stream::impl::peer> weak_peer(peer);
+
+    peer->async_start();
+
+    // Let ready_deadline enqueue peer->ready behind the blocked dispatcher job.
+    // That dispatcher callback must not keep peer alive after the owner closes it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    peer->async_close();
+    peer.reset();
+
+    expect(wait_until([&] { return weak_peer.expired(); }));
+
+    unblock_promise.set_value();
+    blocker.detach_from_dispatcher();
+
+    asio::error_code error_code;
+    raw_socket.close(error_code);
+
+    work_guard.reset();
+    if (io_ctx_thread.joinable()) {
+      io_ctx_thread.join();
+    }
 
     dispatcher->terminate();
     dispatcher = nullptr;

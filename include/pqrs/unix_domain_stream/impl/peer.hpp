@@ -47,60 +47,65 @@ public:
   }
 
   void async_start() {
-    asio::post(socket_.get_executor(), [self = shared_from_this()] {
-      self->start_ready_deadline();
-      self->start_heartbeat_timer();
-      self->refresh_heartbeat_deadline();
-      self->read_header();
-    });
+    asio::post(socket_.get_executor(),
+               [self = shared_from_this()] {
+                 self->start_ready_deadline();
+                 self->start_heartbeat_timer();
+                 self->refresh_heartbeat_deadline();
+                 self->read_header();
+               });
   }
 
   void async_close() {
-    asio::post(socket_.get_executor(), [self = shared_from_this()] {
-      self->close();
-    });
+    asio::post(socket_.get_executor(),
+               [self = shared_from_this()] {
+                 self->close();
+               });
   }
 
   void async_send(const std::vector<uint8_t>& data) {
     auto frame = protocol::make_user_data_frame(data);
 
-    asio::post(socket_.get_executor(), [self = shared_from_this(), frame = std::move(frame)] {
-      self->push_frame(frame);
-    });
+    asio::post(socket_.get_executor(),
+               [self = shared_from_this(), frame = std::move(frame)] {
+                 self->push_frame(frame);
+               });
   }
 
   void async_send_request(uint64_t request_id,
                           const std::vector<uint8_t>& data) {
     auto frame = protocol::make_request_frame(request_id, data);
 
-    asio::post(socket_.get_executor(), [self = shared_from_this(), frame = std::move(frame)] {
-      self->push_frame(frame);
-    });
+    asio::post(socket_.get_executor(),
+               [self = shared_from_this(), frame = std::move(frame)] {
+                 self->push_frame(frame);
+               });
   }
 
   void async_send_response(uint64_t request_id,
                            const std::vector<uint8_t>& data) {
     auto frame = protocol::make_response_frame(request_id, data);
 
-    asio::post(socket_.get_executor(), [self = shared_from_this(), frame = std::move(frame)] {
-      self->push_frame(frame);
-    });
+    asio::post(socket_.get_executor(),
+               [self = shared_from_this(), frame = std::move(frame)] {
+                 self->push_frame(frame);
+               });
   }
 
   void async_send_health_check() {
     auto frame = protocol::make_health_check_frame();
 
-    asio::post(socket_.get_executor(), [self = shared_from_this(), frame = std::move(frame)] {
-      self->push_frame(frame);
-    });
+    asio::post(socket_.get_executor(),
+               [self = shared_from_this(), frame = std::move(frame)] {
+                 self->push_frame(frame);
+               });
   }
 
 private:
   void start_heartbeat_timer() {
     heartbeat_timer_.expires_after(options_.heartbeat_interval);
 
-    auto self = shared_from_this();
-    heartbeat_timer_.async_wait([self](const auto& error_code) {
+    heartbeat_timer_.async_wait([self = shared_from_this()](const auto& error_code) {
       if (!error_code &&
           self->socket_.is_open()) {
         self->push_frame(protocol::make_heartbeat_frame());
@@ -112,8 +117,7 @@ private:
   void refresh_heartbeat_deadline() {
     heartbeat_deadline_.expires_after(options_.heartbeat_timeout);
 
-    auto self = shared_from_this();
-    heartbeat_deadline_.async_wait([self](const auto& error_code) {
+    heartbeat_deadline_.async_wait([self = shared_from_this()](const auto& error_code) {
       if (!error_code) {
         self->handle_error(asio::error::timed_out);
       }
@@ -123,8 +127,7 @@ private:
   void start_ready_deadline() {
     ready_deadline_.expires_after(std::chrono::milliseconds(100));
 
-    auto self = shared_from_this();
-    ready_deadline_.async_wait([self](const auto& error_code) {
+    ready_deadline_.async_wait([self = shared_from_this()](const auto& error_code) {
       if (!error_code) {
         self->ensure_ready();
       }
@@ -139,8 +142,8 @@ private:
     ready_ = true;
     ready_deadline_.cancel();
 
-    enqueue_to_dispatcher([self = shared_from_this()] {
-      self->ready();
+    enqueue_to_dispatcher([this] {
+      ready();
     });
   }
 
@@ -151,10 +154,9 @@ private:
 
     start_read_deadline();
 
-    auto self = shared_from_this();
     asio::async_read(socket_,
                      asio::buffer(read_header_),
-                     [self](auto&& error_code, auto bytes_transferred) {
+                     [self = shared_from_this()](auto&& error_code, auto bytes_transferred) {
                        self->read_deadline_.cancel();
 
                        if (error_code) {
@@ -182,10 +184,9 @@ private:
   void read_body() {
     start_read_deadline();
 
-    auto self = shared_from_this();
     asio::async_read(socket_,
                      asio::buffer(read_body_),
-                     [self](auto&& error_code, auto bytes_transferred) {
+                     [self = shared_from_this()](auto&& error_code, auto bytes_transferred) {
                        self->read_deadline_.cancel();
 
                        if (error_code) {
@@ -215,8 +216,8 @@ private:
 
                            auto v = std::make_shared<std::vector<uint8_t>>(std::begin(self->read_body_) + protocol::type_size,
                                                                            std::end(self->read_body_));
-                           self->enqueue_to_dispatcher([self, v] {
-                             self->received(v);
+                           self->enqueue_to_dispatcher([p = self.get(), v] {
+                             p->received(v);
                            });
                            break;
                          }
@@ -237,12 +238,12 @@ private:
                                                                            std::end(self->read_body_));
 
                            if (type == protocol::message_type::request) {
-                             self->enqueue_to_dispatcher([self, request_id, v] {
-                               self->request_received(request_id, v);
+                             self->enqueue_to_dispatcher([p = self.get(), request_id, v] {
+                               p->request_received(request_id, v);
                              });
                            } else {
-                             self->enqueue_to_dispatcher([self, request_id, v] {
-                               self->response_received(request_id, v);
+                             self->enqueue_to_dispatcher([p = self.get(), request_id, v] {
+                               p->response_received(request_id, v);
                              });
                            }
                            break;
@@ -258,8 +259,8 @@ private:
                            return;
 
                          case protocol::message_type::health_check_response:
-                           self->enqueue_to_dispatcher([self] {
-                             self->health_check_response_received();
+                           self->enqueue_to_dispatcher([p = self.get()] {
+                             p->health_check_response_received();
                            });
                            break;
 
@@ -275,8 +276,7 @@ private:
   void start_read_deadline() {
     read_deadline_.expires_after(options_.read_timeout);
 
-    auto self = shared_from_this();
-    read_deadline_.async_wait([self](const auto& error_code) {
+    read_deadline_.async_wait([self = shared_from_this()](const auto& error_code) {
       if (!error_code) {
         self->handle_error(asio::error::timed_out);
       }
@@ -341,8 +341,7 @@ private:
 
     write_deadline_.expires_after(options_.write_timeout);
 
-    auto self = shared_from_this();
-    write_deadline_.async_wait([self](const auto& error_code) {
+    write_deadline_.async_wait([self = shared_from_this()](const auto& error_code) {
       if (!error_code) {
         self->handle_error(asio::error::timed_out);
       }
@@ -350,7 +349,7 @@ private:
 
     asio::async_write(socket_,
                       asio::buffer(write_queue_.front()),
-                      [self](auto&& error_code, auto) {
+                      [self = shared_from_this()](auto&& error_code, auto) {
                         self->write_deadline_.cancel();
 
                         if (error_code) {
@@ -375,8 +374,8 @@ private:
       return;
     }
 
-    enqueue_to_dispatcher([self = shared_from_this(), error_code] {
-      self->error_occurred(error_code);
+    enqueue_to_dispatcher([this, error_code] {
+      error_occurred(error_code);
     });
 
     close();
@@ -389,8 +388,8 @@ private:
 
     close_socket();
 
-    enqueue_to_dispatcher([self = shared_from_this()] {
-      self->closed();
+    enqueue_to_dispatcher([this] {
+      closed();
     });
   }
 

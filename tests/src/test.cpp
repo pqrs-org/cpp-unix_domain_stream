@@ -459,10 +459,19 @@ int main() {
 
     peer->async_start();
 
-    // Let ready_deadline enqueue peer->ready behind the blocked dispatcher job.
-    // That dispatcher callback must not keep peer alive after the owner closes it.
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    // Wait on the peer io_context until after ready_deadline should have
+    // enqueued peer->ready behind the blocked dispatcher job.
+    auto ready_deadline_passed = std::make_shared<asio::steady_timer>(io_ctx);
+    std::promise<void> ready_deadline_passed_promise;
+    auto ready_deadline_passed_future = ready_deadline_passed_promise.get_future();
+    ready_deadline_passed->expires_after(std::chrono::milliseconds(300));
+    ready_deadline_passed->async_wait([ready_deadline_passed, &ready_deadline_passed_promise](auto&&) {
+      ready_deadline_passed_promise.set_value();
+    });
+    expect(ready_deadline_passed_future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
 
+    // The queued dispatcher callback must not keep peer alive after the owner
+    // closes it.
     peer->async_close();
     peer.reset();
 

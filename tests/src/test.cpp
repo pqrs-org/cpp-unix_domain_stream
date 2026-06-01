@@ -44,6 +44,25 @@ void prepare_socket_file_path(const std::filesystem::path& path) {
   std::filesystem::remove(path, error_code);
 }
 
+bool wait_dispatcher_barrier(const std::shared_ptr<pqrs::dispatcher::dispatcher>& dispatcher,
+                             std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
+  pqrs::dispatcher::extra::dispatcher_client barrier(dispatcher);
+  auto promise = std::make_shared<std::promise<void>>();
+  auto future = promise->get_future();
+
+  if (!barrier.enqueue_to_dispatcher([promise] {
+        promise->set_value();
+      })) {
+    barrier.detach_from_dispatcher();
+    return false;
+  }
+
+  auto result = future.wait_for(timeout) == std::future_status::ready;
+  barrier.detach_from_dispatcher();
+
+  return result;
+}
+
 } // namespace
 
 int main() {
@@ -343,7 +362,7 @@ int main() {
     asio::write(rejected_socket, asio::buffer(request_frame));
 
     expect(wait_until([&] { return verify_peer_count.load() == 1_i; }));
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    expect(wait_dispatcher_barrier(dispatcher));
 
     expect(peer_connected_count.load() == 0_i);
     expect(server_received_count.load() == 0_i);
@@ -645,6 +664,7 @@ int main() {
     auto options = make_options();
 
     std::atomic<size_t> connected_count = 0;
+    std::atomic<size_t> connect_failed_count = 0;
 
     // Start the client before the server so the first connect attempt fails.
     auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
@@ -653,9 +673,12 @@ int main() {
     client->connected.connect([&](auto&&) {
       ++connected_count;
     });
+    client->connect_failed.connect([&](auto&&) {
+      ++connect_failed_count;
+    });
     client->async_start();
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    expect(wait_until([&] { return connect_failed_count.load() >= 1_i; }));
     expect(connected_count.load() == 0_i);
 
     // After the server appears, the reconnect timer should establish exactly one connection.
@@ -780,16 +803,14 @@ int main() {
 
     expect(wait_until([&] { return bound_count.load() == 1_i; }));
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    expect(peer_connected_count.load() == 0_i);
-    expect(verify_peer_count.load() == 0_i);
-
     // Remove the socket file to force the periodic health check to fail and rebind.
     std::error_code error_code;
     std::filesystem::remove(server_socket_file_path, error_code);
 
     expect(wait_until([&] { return closed_count.load() >= 1_i; }));
     expect(wait_until([&] { return bound_count.load() >= 2_i; }));
+    expect(peer_connected_count.load() == 0_i);
+    expect(verify_peer_count.load() == 0_i);
 
     // After rebinding, a real client should still connect and exchange data.
     std::atomic_bool client_connected = false;

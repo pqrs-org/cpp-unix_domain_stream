@@ -164,6 +164,96 @@ int main() {
     dispatcher = nullptr;
   };
 
+  "unix_domain_stream::many_clients"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::many_clients)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    // Stress a single server with many regular client instances in one process.
+    // This exercises peer lifetime, dispatcher signal delivery, and socket close
+    // paths more directly than running the same test binary in parallel.
+    constexpr size_t client_count = 256;
+    constexpr size_t payload_size = 16;
+
+    auto options = pqrs::unix_domain_stream::options(
+        pqrs::unix_domain_stream::options::initialization_parameters{
+            .max_send_queue_size = 128,
+            .reconnect_interval = std::chrono::milliseconds(100),
+            .server_check_interval = std::chrono::milliseconds(60000),
+            .read_timeout = std::chrono::milliseconds(3000),
+            .write_timeout = std::chrono::milliseconds(3000),
+        });
+
+    std::atomic_bool server_bound = false;
+    std::atomic_size_t server_peer_connected_count = 0;
+    std::atomic_size_t client_connected_count = 0;
+    std::atomic_size_t server_received_count = 0;
+    std::atomic_size_t client_received_count = 0;
+
+    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
+                                                                     server_socket_file_path,
+                                                                     options);
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+    server->peer_connected.connect([&](auto, auto&&) {
+      ++server_peer_connected_count;
+    });
+    server->received.connect([&](auto peer_id, auto&& buffer) {
+      server_received_count += buffer->size();
+      server->async_send(peer_id, *buffer);
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+
+    std::vector<std::unique_ptr<pqrs::unix_domain_stream::client>> clients;
+    clients.reserve(client_count);
+
+    for (size_t i = 0; i < client_count; ++i) {
+      auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
+                                                                       server_socket_file_path,
+                                                                       options);
+      client->connected.connect([&](auto&&) {
+        ++client_connected_count;
+      });
+      client->received.connect([&](auto&& buffer) {
+        client_received_count += buffer->size();
+      });
+      client->async_start();
+
+      clients.push_back(std::move(client));
+    }
+
+    expect(wait_until([&] { return client_connected_count.load() == client_count; },
+                      std::chrono::milliseconds(30000)));
+    expect(wait_until([&] { return server_peer_connected_count.load() == client_count; },
+                      std::chrono::milliseconds(30000)));
+
+    for (auto& client : clients) {
+      client->async_send(std::vector<uint8_t>(payload_size, 42));
+    }
+
+    expect(wait_until([&] { return server_received_count.load() == client_count * payload_size; },
+                      std::chrono::milliseconds(30000)));
+    expect(wait_until([&] { return client_received_count.load() == client_count * payload_size; },
+                      std::chrono::milliseconds(30000)));
+
+    // Drop some clients before the rest to make peer close and owner destruction
+    // interleave with the server-side peer cleanup path.
+    for (size_t i = 0; i < clients.size(); i += 2) {
+      clients[i] = nullptr;
+    }
+
+    clients.clear();
+    server = nullptr;
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
   "unix_domain_stream::connected_client_survives_socket_file_removal"_test = [] {
     std::cout << "TEST_CASE(unix_domain_stream::connected_client_survives_socket_file_removal)" << std::endl;
 

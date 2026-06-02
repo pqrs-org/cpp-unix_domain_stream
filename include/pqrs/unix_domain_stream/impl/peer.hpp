@@ -8,6 +8,7 @@
 #include "asio_helper.hpp"
 #include "protocol.hpp"
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <nod/nod.hpp>
 #include <pqrs/dispatcher.hpp>
@@ -41,8 +42,13 @@ public:
         write_deadline_(socket_.get_executor()) {
   }
 
+  // The owner must call async_close before releasing the last shared_ptr so
+  // socket and timer state is closed on `socket_.get_executor()`.
   ~peer() override {
-    close_socket();
+    if (!closed_on_executor_.load()) {
+      abort();
+    }
+
     detach_from_dispatcher();
   }
 
@@ -102,6 +108,7 @@ public:
   }
 
 private:
+  // This method is executed in `io_ctx_thread_`.
   void start_heartbeat_timer() {
     heartbeat_timer_.expires_after(options_.heartbeat_interval);
 
@@ -114,6 +121,7 @@ private:
     });
   }
 
+  // This method is executed in `io_ctx_thread_`.
   void refresh_heartbeat_deadline() {
     heartbeat_deadline_.expires_after(options_.heartbeat_timeout);
 
@@ -124,6 +132,7 @@ private:
     });
   }
 
+  // This method is executed in `io_ctx_thread_`.
   void start_ready_deadline() {
     ready_deadline_.expires_after(std::chrono::milliseconds(100));
 
@@ -134,6 +143,7 @@ private:
     });
   }
 
+  // This method is executed in `io_ctx_thread_`.
   void ensure_ready() {
     if (ready_) {
       return;
@@ -147,6 +157,7 @@ private:
     });
   }
 
+  // This method is executed in `io_ctx_thread_`.
   void read_header() {
     if (!socket_.is_open()) {
       return;
@@ -181,6 +192,7 @@ private:
                      });
   }
 
+  // This method is executed in `io_ctx_thread_`.
   void read_body() {
     start_read_deadline();
 
@@ -273,6 +285,7 @@ private:
                      });
   }
 
+  // This method is executed in `io_ctx_thread_`.
   void start_read_deadline() {
     read_deadline_.expires_after(options_.read_timeout);
 
@@ -283,6 +296,7 @@ private:
     });
   }
 
+  // This method is executed in `io_ctx_thread_`.
   void push_frame(std::vector<uint8_t> frame) {
     if (!socket_.is_open()) {
       return;
@@ -302,6 +316,7 @@ private:
     }
   }
 
+  // This method is executed in `io_ctx_thread_`.
   bool valid_outgoing_frame(const std::vector<uint8_t>& frame) const {
     if (frame.size() < protocol::header_size + protocol::type_size) {
       return false;
@@ -333,6 +348,7 @@ private:
     return false;
   }
 
+  // This method is executed in `io_ctx_thread_`.
   void write() {
     if (!socket_.is_open() ||
         write_queue_.empty()) {
@@ -369,6 +385,7 @@ private:
                       });
   }
 
+  // This method is executed in `io_ctx_thread_`.
   void handle_error(const asio::error_code& error_code) {
     if (error_code == asio::error::operation_aborted) {
       return;
@@ -381,6 +398,7 @@ private:
     close();
   }
 
+  // This method is executed in `io_ctx_thread_`.
   void close() {
     if (!socket_.is_open()) {
       return;
@@ -393,7 +411,10 @@ private:
     });
   }
 
+  // This method is executed in `io_ctx_thread_`.
   void close_socket() {
+    closed_on_executor_ = true;
+
     asio::error_code error_code;
     ready_deadline_.cancel();
     heartbeat_timer_.cancel();
@@ -402,11 +423,11 @@ private:
     write_deadline_.cancel();
     socket_.cancel(error_code);
     socket_.close(error_code);
-    write_queue_.clear();
   }
 
   asio::local::stream_protocol::socket socket_;
   options options_;
+  std::atomic_bool closed_on_executor_ = false;
   bool ready_ = false;
   bool close_after_write_ = false;
   asio::steady_timer ready_deadline_;

@@ -111,6 +111,11 @@ public:
     });
   }
 
+  ~example_app() {
+    server_ = nullptr;
+    client_ = nullptr;
+  }
+
   void async_start() {
     server_->async_start();
   }

@@ -2,6 +2,7 @@
 #include <asio/local/connect_pair.hpp>
 #include <atomic>
 #include <boost/ut.hpp>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <pqrs/unix_domain_stream.hpp>
@@ -164,23 +165,25 @@ int main() {
     dispatcher = nullptr;
   };
 
-  "unix_domain_stream::many_clients"_test = [] {
-    std::cout << "TEST_CASE(unix_domain_stream::many_clients)" << std::endl;
+  "unix_domain_stream::server_destroyed_while_write_queue_is_active"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::server_destroyed_while_write_queue_is_active)" << std::endl;
 
     auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
     auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
 
     prepare_socket_file_path(server_socket_file_path);
 
-    // Stress a single server with many regular client instances in one process.
-    // This exercises peer lifetime, dispatcher signal delivery, and socket close
-    // paths more directly than running the same test binary in parallel.
-    constexpr size_t client_count = 256;
-    constexpr size_t payload_size = 16;
-
+    // Read server responses with small client-side buffers while the server
+    // queues many writes, then destroy the server before the response path
+    // drains. This increases the chance that write completions and peer close
+    // overlap under ASan.
+    constexpr size_t socket_count = 64;
+    constexpr size_t send_count_per_peer = 256;
+    constexpr size_t payload_size = 16384;
     auto options = pqrs::unix_domain_stream::options(
         pqrs::unix_domain_stream::options::initialization_parameters{
-            .max_send_queue_size = 128,
+            .max_message_size = payload_size,
+            .max_send_queue_size = send_count_per_peer + 1,
             .reconnect_interval = std::chrono::milliseconds(100),
             .server_check_interval = std::chrono::milliseconds(60000),
             .read_timeout = std::chrono::milliseconds(3000),
@@ -188,10 +191,10 @@ int main() {
         });
 
     std::atomic_bool server_bound = false;
-    std::atomic_size_t server_peer_connected_count = 0;
-    std::atomic_size_t client_connected_count = 0;
+    std::atomic_size_t peer_connected_count = 0;
     std::atomic_size_t server_received_count = 0;
     std::atomic_size_t client_received_count = 0;
+    auto outbound_payload = std::make_shared<std::vector<uint8_t>>(payload_size, 42);
 
     auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
                                                                      server_socket_file_path,
@@ -200,55 +203,77 @@ int main() {
       server_bound = true;
     });
     server->peer_connected.connect([&](auto, auto&&) {
-      ++server_peer_connected_count;
+      ++peer_connected_count;
     });
     server->received.connect([&](auto peer_id, auto&& buffer) {
       server_received_count += buffer->size();
-      server->async_send(peer_id, *buffer);
+      for (size_t i = 0; i < send_count_per_peer; ++i) {
+        server->async_send(peer_id, *outbound_payload);
+      }
     });
     server->async_start();
     expect(wait_until([&] { return server_bound.load(); }));
 
-    std::vector<std::unique_ptr<pqrs::unix_domain_stream::client>> clients;
-    clients.reserve(client_count);
+    asio::io_context io_ctx;
+    auto work_guard = asio::make_work_guard(io_ctx);
+    std::vector<std::unique_ptr<asio::local::stream_protocol::socket>> sockets;
+    sockets.reserve(socket_count);
 
-    for (size_t i = 0; i < client_count; ++i) {
-      auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
-                                                                       server_socket_file_path,
-                                                                       options);
-      client->connected.connect([&](auto&&) {
-        ++client_connected_count;
-      });
-      client->received.connect([&](auto&& buffer) {
-        client_received_count += buffer->size();
-      });
-      client->async_start();
-
-      clients.push_back(std::move(client));
+    for (size_t i = 0; i < socket_count; ++i) {
+      auto socket = std::make_unique<asio::local::stream_protocol::socket>(io_ctx);
+      socket->connect(asio::local::stream_protocol::endpoint(server_socket_file_path));
+      sockets.push_back(std::move(socket));
     }
 
-    expect(wait_until([&] { return client_connected_count.load() == client_count; },
-                      std::chrono::milliseconds(30000)));
-    expect(wait_until([&] { return server_peer_connected_count.load() == client_count; },
-                      std::chrono::milliseconds(30000)));
+    std::atomic_bool keep_reading = true;
+    std::vector<std::array<uint8_t, 4096>> read_buffers(socket_count);
+    std::function<void(size_t)> start_read = [&](size_t index) {
+      if (!keep_reading.load()) {
+        return;
+      }
 
-    for (auto& client : clients) {
-      client->async_send(std::vector<uint8_t>(payload_size, 42));
+      sockets[index]->async_read_some(
+          asio::buffer(read_buffers[index]),
+          [&, index](auto&& error_code, auto bytes_transferred) {
+            if (!error_code) {
+              client_received_count += bytes_transferred;
+              start_read(index);
+            }
+          });
+    };
+
+    for (size_t i = 0; i < socket_count; ++i) {
+      start_read(i);
     }
 
-    expect(wait_until([&] { return server_received_count.load() == client_count * payload_size; },
-                      std::chrono::milliseconds(30000)));
-    expect(wait_until([&] { return client_received_count.load() == client_count * payload_size; },
-                      std::chrono::milliseconds(30000)));
+    std::thread io_ctx_thread([&] {
+      io_ctx.run();
+    });
 
-    // Drop some clients before the rest to make peer close and owner destruction
-    // interleave with the server-side peer cleanup path.
-    for (size_t i = 0; i < clients.size(); i += 2) {
-      clients[i] = nullptr;
+    auto user_data_frame = pqrs::unix_domain_stream::impl::protocol::make_user_data_frame(std::vector<uint8_t>{1});
+    for (auto& socket : sockets) {
+      asio::write(*socket, asio::buffer(user_data_frame));
     }
 
-    clients.clear();
+    expect(wait_until([&] { return peer_connected_count.load() == socket_count; },
+                      std::chrono::milliseconds(10000)));
+    expect(wait_until([&] { return server_received_count.load() == socket_count; },
+                      std::chrono::milliseconds(10000)));
+    expect(wait_until([&] { return client_received_count.load() > 0; },
+                      std::chrono::milliseconds(10000)));
+
     server = nullptr;
+
+    keep_reading = false;
+    for (auto& socket : sockets) {
+      asio::error_code error_code;
+      socket->close(error_code);
+    }
+
+    work_guard.reset();
+    if (io_ctx_thread.joinable()) {
+      io_ctx_thread.join();
+    }
 
     dispatcher->terminate();
     dispatcher = nullptr;

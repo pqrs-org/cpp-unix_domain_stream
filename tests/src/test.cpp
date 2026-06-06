@@ -8,6 +8,7 @@
 #include <pqrs/unix_domain_stream.hpp>
 #include <pqrs/unix_domain_stream/impl/protocol.hpp>
 #include <thread>
+#include <utility>
 
 namespace {
 
@@ -64,6 +65,64 @@ bool wait_dispatcher_barrier(const std::shared_ptr<pqrs::dispatcher::dispatcher>
   return result;
 }
 
+class test_server final {
+public:
+  test_server(const test_server&) = delete;
+
+  template <typename... Args>
+  explicit test_server(Args&&... args) : server_(std::make_unique<pqrs::unix_domain_stream::server>(std::forward<Args>(args)...)),
+                                         server_ptr_(server_.get()) {
+  }
+
+  ~test_server() {
+    reset();
+  }
+
+  pqrs::unix_domain_stream::server* operator->() const {
+    return server_ptr_;
+  }
+
+  void reset() {
+    if (server_) {
+      server_.reset();
+      server_ptr_ = nullptr;
+    }
+  }
+
+private:
+  std::unique_ptr<pqrs::unix_domain_stream::server> server_;
+  pqrs::unix_domain_stream::server* server_ptr_;
+};
+
+class test_client final {
+public:
+  test_client(const test_client&) = delete;
+
+  template <typename... Args>
+  explicit test_client(Args&&... args) : client_(std::make_unique<pqrs::unix_domain_stream::client>(std::forward<Args>(args)...)),
+                                         client_ptr_(client_.get()) {
+  }
+
+  ~test_client() {
+    reset();
+  }
+
+  pqrs::unix_domain_stream::client* operator->() const {
+    return client_ptr_;
+  }
+
+  void reset() {
+    if (client_) {
+      client_.reset();
+      client_ptr_ = nullptr;
+    }
+  }
+
+private:
+  std::unique_ptr<pqrs::unix_domain_stream::client> client_;
+  pqrs::unix_domain_stream::client* client_ptr_;
+};
+
 } // namespace
 
 int main() {
@@ -114,9 +173,9 @@ int main() {
     std::atomic_bool client_connected = false;
 
     // Echo any server-side user data back to the connected client.
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
     server->bound.connect([&] {
       server_bound = true;
     });
@@ -133,9 +192,9 @@ int main() {
     server->async_start();
     expect(wait_until([&] { return server_bound.load(); }));
 
-    auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
     client->connected.connect([&](auto&&) {
       client_connected = true;
     });
@@ -157,9 +216,8 @@ int main() {
     expect(connected_peer_id.load() > 0_i);
     expect(server_received_count.load() == 32_i);
     expect(client_received_count.load() == 32_i);
-
-    client = nullptr;
-    server = nullptr;
+    client.reset();
+    server.reset();
 
     dispatcher->terminate();
     dispatcher = nullptr;
@@ -196,21 +254,62 @@ int main() {
     std::atomic_size_t client_received_count = 0;
     auto outbound_payload = std::make_shared<std::vector<uint8_t>>(payload_size, 42);
 
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
-    server->bound.connect([&] {
-      server_bound = true;
-    });
-    server->peer_connected.connect([&](auto, auto&&) {
-      ++peer_connected_count;
-    });
-    server->received.connect([&](auto peer_id, auto&& buffer) {
-      server_received_count += buffer->size();
-      for (size_t i = 0; i < send_count_per_peer; ++i) {
-        server->async_send(peer_id, *outbound_payload);
+    struct active_write_server final {
+      active_write_server(std::shared_ptr<pqrs::dispatcher::dispatcher> dispatcher,
+                          const pqrs::unix_domain_stream::options& options,
+                          std::atomic_bool& server_bound,
+                          std::atomic_size_t& peer_connected_count,
+                          std::atomic_size_t& server_received_count,
+                          size_t send_count_per_peer,
+                          std::shared_ptr<std::vector<uint8_t>> outbound_payload)
+          : server_(std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
+                                                                       server_socket_file_path,
+                                                                       options)),
+            server_ptr_(server_.get()),
+            server_bound_(server_bound),
+            peer_connected_count_(peer_connected_count),
+            server_received_count_(server_received_count),
+            send_count_per_peer_(send_count_per_peer),
+            outbound_payload_(std::move(outbound_payload)) {
+        server_->bound.connect([this] {
+          server_bound_ = true;
+        });
+        server_->peer_connected.connect([this](auto, auto&&) {
+          ++peer_connected_count_;
+        });
+        server_->received.connect([this](auto peer_id, auto&& buffer) {
+          for (size_t i = 0; i < send_count_per_peer_; ++i) {
+            server_ptr_->async_send(peer_id, *outbound_payload_);
+          }
+          server_received_count_ += buffer->size();
+        });
       }
-    });
+
+      ~active_write_server() {
+        server_.reset();
+      }
+
+      void async_start() {
+        server_ptr_->async_start();
+      }
+
+    private:
+      std::unique_ptr<pqrs::unix_domain_stream::server> server_;
+      pqrs::unix_domain_stream::server* server_ptr_;
+      std::atomic_bool& server_bound_;
+      std::atomic_size_t& peer_connected_count_;
+      std::atomic_size_t& server_received_count_;
+      size_t send_count_per_peer_;
+      std::shared_ptr<std::vector<uint8_t>> outbound_payload_;
+    };
+
+    auto server = std::make_unique<active_write_server>(dispatcher,
+                                                        options,
+                                                        server_bound,
+                                                        peer_connected_count,
+                                                        server_received_count,
+                                                        send_count_per_peer,
+                                                        outbound_payload);
     server->async_start();
     expect(wait_until([&] { return server_bound.load(); }));
 
@@ -261,8 +360,7 @@ int main() {
                       std::chrono::milliseconds(10000)));
     expect(wait_until([&] { return client_received_count.load() > 0; },
                       std::chrono::milliseconds(10000)));
-
-    server = nullptr;
+    server.reset();
 
     keep_reading = false;
     for (auto& socket : sockets) {
@@ -302,9 +400,9 @@ int main() {
     std::atomic_bool server_bound = false;
     std::atomic_bool client_connected = false;
 
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
     server->bound.connect([&] {
       server_bound = true;
     });
@@ -318,9 +416,9 @@ int main() {
     server->async_start();
     expect(wait_until([&] { return server_bound.load(); }));
 
-    auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
     client->connected.connect([&](auto&&) {
       client_connected = true;
     });
@@ -343,9 +441,8 @@ int main() {
 
     expect(wait_until([&] { return client_received_count.load() == 24_i; }));
     expect(server_received_count.load() == 24_i);
-
-    client = nullptr;
-    server = nullptr;
+    client.reset();
+    server.reset();
 
     dispatcher->terminate();
     dispatcher = nullptr;
@@ -371,7 +468,7 @@ int main() {
     std::promise<std::thread::id> peer_connected_thread_id_promise;
 
     // Capture the dispatcher thread used by verify_peer and peer_connected.
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(
+    test_server server(
         dispatcher,
         server_socket_file_path,
         options,
@@ -390,9 +487,9 @@ int main() {
     server->async_start();
     expect(wait_until([&] { return server_bound.load(); }));
 
-    auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
     client->connected.connect([&](auto&&) {
       client_connected = true;
     });
@@ -406,9 +503,8 @@ int main() {
     expect(peer_connected_thread_id_future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
     // verify_peer must run on the dispatcher so callers can use dispatcher-bound state safely.
     expect(verify_peer_thread_id_future.get() == peer_connected_thread_id_future.get());
-
-    client = nullptr;
-    server = nullptr;
+    client.reset();
+    server.reset();
 
     dispatcher->terminate();
     dispatcher = nullptr;
@@ -439,7 +535,7 @@ int main() {
 
     // Reject the first peer and accept the second peer, without depending on
     // platform-specific peer_credentials values.
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(
+    test_server server(
         dispatcher,
         server_socket_file_path,
         options,
@@ -501,8 +597,7 @@ int main() {
     expect(wait_until([&] { return server_request_received_count.load() == 1_i; }));
 
     accepted_socket.close(close_error_code);
-
-    server = nullptr;
+    server.reset();
 
     dispatcher->terminate();
     dispatcher = nullptr;
@@ -522,16 +617,16 @@ int main() {
     std::atomic_size_t peer_verification_failed_count = 0;
 
     // The server accepts connections normally; the client rejects the server peer.
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
     server->bound.connect([&] {
       server_bound = true;
     });
     server->async_start();
     expect(wait_until([&] { return server_bound.load(); }));
 
-    auto client = std::make_unique<pqrs::unix_domain_stream::client>(
+    test_client client(
         dispatcher,
         server_socket_file_path,
         options,
@@ -549,9 +644,8 @@ int main() {
     // A rejected server peer should notify failure and never publish connected.
     expect(wait_until([&] { return peer_verification_failed_count.load() >= 1_i; }));
     expect(!client_connected.load());
-
-    client = nullptr;
-    server = nullptr;
+    client.reset();
+    server.reset();
 
     dispatcher->terminate();
     dispatcher = nullptr;
@@ -638,9 +732,9 @@ int main() {
     std::atomic_bool server_bound = false;
     std::atomic_bool client_connected = false;
 
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
     server->bound.connect([&] {
       server_bound = true;
     });
@@ -662,9 +756,9 @@ int main() {
     server->async_start();
     expect(wait_until([&] { return server_bound.load(); }));
 
-    auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
     client->connected.connect([&](auto&&) {
       client_connected = true;
     });
@@ -699,9 +793,8 @@ int main() {
     expect(response2 != nullptr);
     expect(*response1 == std::vector<uint8_t>{10});
     expect(*response2 == std::vector<uint8_t>{20});
-
-    client = nullptr;
-    server = nullptr;
+    client.reset();
+    server.reset();
 
     dispatcher->terminate();
     dispatcher = nullptr;
@@ -721,9 +814,9 @@ int main() {
     std::atomic_size_t server_request_received_count = 0;
 
     // Accept the request on the server, but intentionally do not respond.
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
     server->bound.connect([&] {
       server_bound = true;
     });
@@ -733,9 +826,9 @@ int main() {
     server->async_start();
     expect(wait_until([&] { return server_bound.load(); }));
 
-    auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
     client->connected.connect([&](auto&&) {
       client_connected = true;
     });
@@ -760,9 +853,8 @@ int main() {
     expect(error_code == asio::error::timed_out);
     expect(response == nullptr);
     expect(server_request_received_count.load() == 1_i);
-
-    client = nullptr;
-    server = nullptr;
+    client.reset();
+    server.reset();
 
     dispatcher->terminate();
     dispatcher = nullptr;
@@ -782,9 +874,9 @@ int main() {
     std::atomic<size_t> connect_failed_count = 0;
 
     // Start the client before the server so the first connect attempt fails.
-    auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
     client->connected.connect([&](auto&&) {
       ++connected_count;
     });
@@ -798,9 +890,9 @@ int main() {
 
     // After the server appears, the reconnect timer should establish exactly one connection.
     std::atomic_bool server_bound = false;
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
     server->bound.connect([&] {
       server_bound = true;
     });
@@ -809,9 +901,8 @@ int main() {
 
     expect(wait_until([&] { return connected_count.load() == 1_i; }));
     expect(connected_count.load() == 1_i);
-
-    client = nullptr;
-    server = nullptr;
+    client.reset();
+    server.reset();
 
     dispatcher->terminate();
     dispatcher = nullptr;
@@ -836,9 +927,9 @@ int main() {
     std::atomic_bool error_occurred = false;
 
     // Configure both peers with a small outgoing user data limit.
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
     server->bound.connect([&] {
       server_bound = true;
     });
@@ -846,9 +937,9 @@ int main() {
     expect(wait_until([&] { return server_bound.load(); }));
 
     std::atomic_bool client_connected = false;
-    auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
     client->connected.connect([&](auto&&) {
       client_connected = true;
     });
@@ -863,9 +954,8 @@ int main() {
     client->async_send(std::vector<uint8_t>(9, 42));
 
     expect(wait_until([&] { return error_occurred.load(); }));
-
-    client = nullptr;
-    server = nullptr;
+    client.reset();
+    server.reset();
 
     dispatcher->terminate();
     dispatcher = nullptr;
@@ -894,7 +984,7 @@ int main() {
     std::atomic<size_t> verify_peer_count = 0;
 
     // Server health checks are internal and must not look like normal peers.
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(
+    test_server server(
         dispatcher,
         server_socket_file_path,
         options,
@@ -929,9 +1019,9 @@ int main() {
 
     // After rebinding, a real client should still connect and exchange data.
     std::atomic_bool client_connected = false;
-    auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
     client->connected.connect([&](auto&&) {
       client_connected = true;
     });
@@ -947,9 +1037,8 @@ int main() {
     expect(wait_until([&] { return client_received_count.load() == 16_i; }));
     expect(peer_connected_count.load() == 1_i);
     expect(verify_peer_count.load() == 1_i);
-
-    client = nullptr;
-    server = nullptr;
+    client.reset();
+    server.reset();
 
     dispatcher->terminate();
     dispatcher = nullptr;
@@ -976,9 +1065,9 @@ int main() {
     std::atomic_bool peer_closed = false;
 
     // Use a raw socket so only the frame header is sent.
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
     server->bound.connect([&] {
       server_bound = true;
     });
@@ -1005,8 +1094,7 @@ int main() {
 
     asio::error_code error_code;
     socket.close(error_code);
-
-    server = nullptr;
+    server.reset();
 
     dispatcher->terminate();
     dispatcher = nullptr;
@@ -1035,9 +1123,9 @@ int main() {
     std::atomic_size_t message_size_error_count = 0;
     std::atomic_size_t invalid_argument_error_count = 0;
 
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
     server->bound.connect([&] {
       server_bound = true;
     });
@@ -1145,8 +1233,7 @@ int main() {
         .expected_peer_closed_count = 5,
     });
     expect(invalid_argument_error_count.load() == 1_i);
-
-    server = nullptr;
+    server.reset();
 
     dispatcher->terminate();
     dispatcher = nullptr;
@@ -1176,9 +1263,9 @@ int main() {
     std::atomic_bool peer_closed = false;
 
     // Connect a raw socket that never sends any frames or heartbeats.
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
     server->bound.connect([&] {
       server_bound = true;
     });
@@ -1206,8 +1293,7 @@ int main() {
 
     asio::error_code error_code;
     socket.close(error_code);
-
-    server = nullptr;
+    server.reset();
 
     dispatcher->terminate();
     dispatcher = nullptr;
@@ -1236,9 +1322,9 @@ int main() {
     std::atomic_bool client_connected = false;
 
     // Echo user data while both sides are also exchanging heartbeat frames.
-    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
     server->bound.connect([&] {
       server_bound = true;
     });
@@ -1249,9 +1335,9 @@ int main() {
     server->async_start();
     expect(wait_until([&] { return server_bound.load(); }));
 
-    auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
-                                                                     server_socket_file_path,
-                                                                     options);
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
     client->connected.connect([&](auto&&) {
       client_connected = true;
     });
@@ -1269,9 +1355,8 @@ int main() {
     expect(wait_until([&] { return client_received_count.load() == 16_i; }));
     expect(server_received_count.load() == 16_i);
     expect(client_received_count.load() == 16_i);
-
-    client = nullptr;
-    server = nullptr;
+    client.reset();
+    server.reset();
 
     dispatcher->terminate();
     dispatcher = nullptr;

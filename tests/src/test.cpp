@@ -448,6 +448,75 @@ int main() {
     dispatcher = nullptr;
   };
 
+  "unix_domain_stream::server_removes_stale_socket_file_on_start"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::server_removes_stale_socket_file_on_start)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    // Leave behind a socket pathname without a listening server.
+    asio::io_context io_ctx;
+    asio::local::stream_protocol::acceptor stale_acceptor(io_ctx);
+    stale_acceptor.open(asio::local::stream_protocol::endpoint(server_socket_file_path).protocol());
+    stale_acceptor.bind(asio::local::stream_protocol::endpoint(server_socket_file_path));
+    stale_acceptor.listen();
+    stale_acceptor.close();
+    expect(std::filesystem::exists(server_socket_file_path));
+
+    asio::local::stream_protocol::socket stale_client_socket(io_ctx);
+    asio::error_code stale_connect_error_code;
+    stale_client_socket.connect(asio::local::stream_protocol::endpoint(server_socket_file_path),
+                                stale_connect_error_code);
+    expect(static_cast<bool>(stale_connect_error_code));
+
+    auto options = make_options();
+    std::atomic_bool stale_client_connected = false;
+    std::atomic_bool stale_client_connect_failed = false;
+    test_client stale_client(dispatcher,
+                             server_socket_file_path,
+                             options);
+    stale_client->connected.connect([&](auto&&) {
+      stale_client_connected = true;
+    });
+    stale_client->connect_failed.connect([&](auto&&) {
+      stale_client_connect_failed = true;
+    });
+    stale_client->async_start();
+    expect(wait_until([&] { return stale_client_connect_failed.load(); }));
+    expect(!stale_client_connected.load());
+    stale_client.reset();
+
+    std::atomic_bool server_bound = false;
+    std::atomic_bool client_connected = false;
+
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+    expect(std::filesystem::exists(server_socket_file_path));
+
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
+    client->connected.connect([&](auto&&) {
+      client_connected = true;
+    });
+    client->async_start();
+    expect(wait_until([&] { return client_connected.load(); }));
+
+    client.reset();
+    server.reset();
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
   "unix_domain_stream::verify_peer_runs_on_dispatcher"_test = [] {
     std::cout << "TEST_CASE(unix_domain_stream::verify_peer_runs_on_dispatcher)" << std::endl;
 

@@ -977,6 +977,116 @@ int main() {
     dispatcher = nullptr;
   };
 
+  "unix_domain_stream::client_invalidate_connection"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::client_invalidate_connection)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto options = make_options();
+
+    std::atomic_bool server_bound = false;
+    std::atomic<size_t> client_connected_count = 0;
+    std::atomic<size_t> client_received_count = 0;
+
+    // Echo data so the test can verify that the second connection is usable.
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+    server->received.connect([&](auto peer_id, auto&& buffer) {
+      server->async_send(peer_id, *buffer);
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
+    client->connected.connect([&](auto&&) {
+      ++client_connected_count;
+    });
+    client->received.connect([&](auto&& buffer) {
+      client_received_count += buffer->size();
+    });
+    client->async_start();
+    expect(wait_until([&] { return client_connected_count.load() == 1_i; }));
+
+    // Drop the current peer and let the normal reconnect path establish a new one.
+    client->async_invalidate_connection();
+
+    expect(wait_until([&] { return client_connected_count.load() >= 2_i; }));
+
+    client->async_send(std::vector<uint8_t>(8, 42));
+
+    expect(wait_until([&] { return client_received_count.load() == 8_i; }));
+    expect(client_connected_count.load() >= 2_i);
+    expect(client_received_count.load() == 8_i);
+    client.reset();
+    server.reset();
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
+  "unix_domain_stream::client_invalidate_connection_before_server_start"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::client_invalidate_connection_before_server_start)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto options = make_options();
+
+    std::atomic<size_t> connected_count = 0;
+    std::atomic<size_t> connect_failed_count = 0;
+
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
+    client->connected.connect([&](auto&&) {
+      ++connected_count;
+    });
+    client->connect_failed.connect([&](auto&&) {
+      ++connect_failed_count;
+    });
+    client->async_start();
+
+    expect(wait_until([&] { return connect_failed_count.load() >= 1_i; }));
+
+    // Invalidate while the client is in the reconnect loop before any server exists.
+    // The stale connect attempt must not be reused after the server starts.
+    client->async_invalidate_connection();
+    client->async_invalidate_connection();
+
+    std::atomic_bool server_bound = false;
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+
+    expect(wait_until([&] { return connected_count.load() == 1_i; }));
+
+    // Give any duplicate reconnect timer a chance to run.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    expect(wait_dispatcher_barrier(dispatcher));
+    expect(connected_count.load() == 1_i);
+    client.reset();
+    server.reset();
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
   "unix_domain_stream::max_message_size"_test = [] {
     std::cout << "TEST_CASE(unix_domain_stream::max_message_size)" << std::endl;
 

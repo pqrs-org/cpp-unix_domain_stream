@@ -11,11 +11,12 @@ class example_app final {
 public:
   example_app(std::shared_ptr<pqrs::dispatcher::dispatcher> dispatcher,
               const std::filesystem::path& server_socket_file_path,
-              const pqrs::unix_domain_stream::options& options)
+              const pqrs::unix_domain_stream::server_options& server_options,
+              const pqrs::unix_domain_stream::client_options& client_options)
       : server_(std::make_unique<pqrs::unix_domain_stream::server>(
             dispatcher,
             server_socket_file_path,
-            options,
+            server_options,
             [](const auto& credentials) {
               std::cout << "server verify_peer" << std::endl;
               example_app::output_peer_credentials(credentials);
@@ -23,7 +24,7 @@ public:
             })),
         client_(std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
                                                                    server_socket_file_path,
-                                                                   options)) {
+                                                                   client_options)) {
     server_->bound.connect([this] {
       std::cout << "server bound" << std::endl;
       client_->async_start();
@@ -178,14 +179,24 @@ int main() {
   std::error_code error_code;
   std::filesystem::create_directories(server_socket_file_path.parent_path(), error_code);
 
-  pqrs::unix_domain_stream::options options(
-      pqrs::unix_domain_stream::options::initialization_parameters{
+  pqrs::unix_domain_stream::server_options server_options{
+      {
           .max_send_queue_size = 128,
-      });
+      },
+      {},
+  };
+
+  pqrs::unix_domain_stream::client_options client_options{
+      {
+          .max_send_queue_size = 128,
+      },
+      {},
+  };
 
   auto app = std::make_unique<example_app>(dispatcher,
                                            server_socket_file_path,
-                                           options);
+                                           server_options,
+                                           client_options);
   app->async_start();
 
   // ============================================================

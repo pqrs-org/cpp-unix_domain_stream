@@ -14,9 +14,9 @@ Unix domain stream socket server and client.
 - Server will rebind automatically when bind or accept fails.
 - Server periodically self-connects and exchanges an internal health-check frame. This detects cases such as the socket file being removed.
 - Client will reconnect automatically when connect fails or the connection is closed.
-- Peers periodically exchange heartbeat frames and close idle connections when `options::heartbeat_timeout` is exceeded.
-- Peers close connections when a single read operation exceeds `options::read_timeout`.
-- Peers close connections when a single write operation exceeds `options::write_timeout`.
+- Peers periodically exchange heartbeat frames and close idle connections when `common_options::heartbeat_timeout` is exceeded.
+- Peers close connections when a single read operation exceeds `common_options::read_timeout`.
+- Peers close connections when a single write operation exceeds `common_options::write_timeout`.
 
 ## Requirements
 

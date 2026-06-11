@@ -16,13 +16,60 @@ const std::filesystem::path server_socket_file_path("tmp/server.sock");
 
 using async_request_test_result = std::pair<asio::error_code, std::shared_ptr<std::vector<uint8_t>>>;
 
-pqrs::unix_domain_stream::options make_options() {
-  return pqrs::unix_domain_stream::options(
-      pqrs::unix_domain_stream::options::initialization_parameters{
-          .max_send_queue_size = 128,
-          .reconnect_interval = std::chrono::milliseconds(100),
-          .write_timeout = std::chrono::milliseconds(1000),
-      });
+struct test_options final {
+  struct initialization_parameters final {
+    pqrs::unix_domain_stream::common_options::initialization_parameters common;
+    pqrs::unix_domain_stream::client_options::initialization_parameters client;
+    pqrs::unix_domain_stream::server_options::initialization_parameters server;
+  };
+
+  test_options() : client(),
+                   server() {
+  }
+
+  explicit test_options(const initialization_parameters& parameters)
+      : client(parameters.common,
+               parameters.client),
+        server(parameters.common,
+               parameters.server) {
+  }
+
+  static initialization_parameters make_parameters(
+      const pqrs::unix_domain_stream::common_options::initialization_parameters& common,
+      const pqrs::unix_domain_stream::client_options::initialization_parameters& client,
+      const pqrs::unix_domain_stream::server_options::initialization_parameters& server) {
+    return {
+        .common = common,
+        .client = client,
+        .server = server,
+    };
+  }
+
+  operator const pqrs::unix_domain_stream::client_options&() const {
+    return client;
+  }
+
+  operator const pqrs::unix_domain_stream::server_options&() const {
+    return server;
+  }
+
+  pqrs::unix_domain_stream::client_options client;
+  pqrs::unix_domain_stream::server_options server;
+};
+
+test_options make_options() {
+  return test_options(
+      test_options::make_parameters(
+          {
+              .max_send_queue_size = 128,
+              .write_timeout = std::chrono::milliseconds(1000),
+          },
+          {
+              .reconnect_interval = std::chrono::milliseconds(100),
+          },
+          {
+              .bind_retry_interval = std::chrono::milliseconds(100),
+          }));
 }
 
 template <typename T>
@@ -132,29 +179,50 @@ int main() {
   "unix_domain_stream::options_initialization_parameters"_test = [] {
     std::cout << "TEST_CASE(unix_domain_stream::options_initialization_parameters)" << std::endl;
 
-    // Ensure every initialization parameter is copied into options as-is.
-    pqrs::unix_domain_stream::options options(
-        pqrs::unix_domain_stream::options::initialization_parameters{
-            .max_message_size = 123,
-            .max_send_queue_size = 456,
+    pqrs::unix_domain_stream::common_options::initialization_parameters common_parameters{
+        .max_message_size = 123,
+        .max_send_queue_size = 456,
+        .heartbeat_interval = std::chrono::milliseconds(456),
+        .heartbeat_timeout = std::chrono::milliseconds(567),
+        .read_timeout = std::chrono::milliseconds(678),
+        .write_timeout = std::chrono::milliseconds(890),
+    };
+
+    // Ensure every client initialization parameter is copied into client_options as-is.
+    pqrs::unix_domain_stream::client_options client_options(
+        common_parameters,
+        pqrs::unix_domain_stream::client_options::initialization_parameters{
             .reconnect_interval = std::chrono::milliseconds(789),
-            .server_check_interval = std::chrono::milliseconds(234),
-            .server_check_timeout = std::chrono::milliseconds(345),
-            .heartbeat_interval = std::chrono::milliseconds(456),
-            .heartbeat_timeout = std::chrono::milliseconds(567),
-            .read_timeout = std::chrono::milliseconds(678),
-            .write_timeout = std::chrono::milliseconds(890),
+            .invalidate_connection_on_request_error = false,
         });
 
-    expect(options.max_message_size == 123_i);
-    expect(options.max_send_queue_size == 456_i);
-    expect(options.reconnect_interval == std::chrono::milliseconds(789));
-    expect(options.server_check_interval == std::chrono::milliseconds(234));
-    expect(options.server_check_timeout == std::chrono::milliseconds(345));
-    expect(options.heartbeat_interval == std::chrono::milliseconds(456));
-    expect(options.heartbeat_timeout == std::chrono::milliseconds(567));
-    expect(options.read_timeout == std::chrono::milliseconds(678));
-    expect(options.write_timeout == std::chrono::milliseconds(890));
+    expect(client_options.max_message_size == 123_i);
+    expect(client_options.max_send_queue_size == 456_i);
+    expect(client_options.reconnect_interval == std::chrono::milliseconds(789));
+    expect(client_options.heartbeat_interval == std::chrono::milliseconds(456));
+    expect(client_options.heartbeat_timeout == std::chrono::milliseconds(567));
+    expect(client_options.read_timeout == std::chrono::milliseconds(678));
+    expect(client_options.write_timeout == std::chrono::milliseconds(890));
+    expect(client_options.invalidate_connection_on_request_error == false);
+
+    // Ensure every server initialization parameter is copied into server_options as-is.
+    pqrs::unix_domain_stream::server_options server_options(
+        common_parameters,
+        pqrs::unix_domain_stream::server_options::initialization_parameters{
+            .bind_retry_interval = std::chrono::milliseconds(789),
+            .socket_path_health_check_interval = std::chrono::milliseconds(234),
+            .socket_path_health_check_timeout = std::chrono::milliseconds(345),
+        });
+
+    expect(server_options.max_message_size == 123_i);
+    expect(server_options.max_send_queue_size == 456_i);
+    expect(server_options.bind_retry_interval == std::chrono::milliseconds(789));
+    expect(server_options.socket_path_health_check_interval == std::chrono::milliseconds(234));
+    expect(server_options.socket_path_health_check_timeout == std::chrono::milliseconds(345));
+    expect(server_options.heartbeat_interval == std::chrono::milliseconds(456));
+    expect(server_options.heartbeat_timeout == std::chrono::milliseconds(567));
+    expect(server_options.read_timeout == std::chrono::milliseconds(678));
+    expect(server_options.write_timeout == std::chrono::milliseconds(890));
   };
 
   "unix_domain_stream::client_server"_test = [] {
@@ -238,15 +306,20 @@ int main() {
     constexpr size_t socket_count = 64;
     constexpr size_t send_count_per_peer = 256;
     constexpr size_t payload_size = 16384;
-    auto options = pqrs::unix_domain_stream::options(
-        pqrs::unix_domain_stream::options::initialization_parameters{
+    auto options = test_options(test_options::make_parameters(
+        {
             .max_message_size = payload_size,
             .max_send_queue_size = send_count_per_peer + 1,
-            .reconnect_interval = std::chrono::milliseconds(100),
-            .server_check_interval = std::chrono::milliseconds(60000),
             .read_timeout = std::chrono::milliseconds(3000),
             .write_timeout = std::chrono::milliseconds(3000),
-        });
+        },
+        {
+            .reconnect_interval = std::chrono::milliseconds(100),
+        },
+        {
+            .bind_retry_interval = std::chrono::milliseconds(100),
+            .socket_path_health_check_interval = std::chrono::milliseconds(60000),
+        }));
 
     std::atomic_bool server_bound = false;
     std::atomic_size_t peer_connected_count = 0;
@@ -256,7 +329,7 @@ int main() {
 
     struct active_write_server final {
       active_write_server(std::shared_ptr<pqrs::dispatcher::dispatcher> dispatcher,
-                          const pqrs::unix_domain_stream::options& options,
+                          const test_options& options,
                           std::atomic_bool& server_bound,
                           std::atomic_size_t& peer_connected_count,
                           std::atomic_size_t& server_received_count,
@@ -387,13 +460,18 @@ int main() {
 
     // Keep the server health check out of this test. This case is only about
     // the already accepted socket, not the server's rebind recovery path.
-    auto options = pqrs::unix_domain_stream::options(
-        pqrs::unix_domain_stream::options::initialization_parameters{
+    auto options = test_options(test_options::make_parameters(
+        {
             .max_send_queue_size = 128,
-            .reconnect_interval = std::chrono::milliseconds(100),
-            .server_check_interval = std::chrono::milliseconds(60000),
             .write_timeout = std::chrono::milliseconds(1000),
-        });
+        },
+        {
+            .reconnect_interval = std::chrono::milliseconds(100),
+        },
+        {
+            .bind_retry_interval = std::chrono::milliseconds(100),
+            .socket_path_health_check_interval = std::chrono::milliseconds(60000),
+        }));
     std::atomic<pqrs::unix_domain_stream::peer_id> connected_peer_id = 0;
     std::atomic<size_t> server_received_count = 0;
     std::atomic<size_t> client_received_count = 0;
@@ -525,10 +603,15 @@ int main() {
 
     prepare_socket_file_path(server_socket_file_path);
 
-    pqrs::unix_domain_stream::options options(
-        pqrs::unix_domain_stream::options::initialization_parameters{
-            .server_check_interval = std::chrono::milliseconds(60000),
-        });
+    auto options = test_options(test_options::make_parameters(
+        {},
+        {
+            .reconnect_interval = std::chrono::milliseconds(1000),
+        },
+        {
+            .bind_retry_interval = std::chrono::milliseconds(1000),
+            .socket_path_health_check_interval = std::chrono::milliseconds(60000),
+        }));
 
     std::atomic_bool server_bound = false;
     std::atomic_bool client_connected = false;
@@ -587,14 +670,19 @@ int main() {
 
     prepare_socket_file_path(server_socket_file_path);
 
-    auto options = pqrs::unix_domain_stream::options(
-        pqrs::unix_domain_stream::options::initialization_parameters{
+    auto options = test_options(test_options::make_parameters(
+        {
             .max_send_queue_size = 128,
-            .reconnect_interval = std::chrono::milliseconds(100),
-            .server_check_interval = std::chrono::milliseconds(60000),
             .read_timeout = std::chrono::milliseconds(1000),
             .write_timeout = std::chrono::milliseconds(1000),
-        });
+        },
+        {
+            .reconnect_interval = std::chrono::milliseconds(100),
+        },
+        {
+            .bind_retry_interval = std::chrono::milliseconds(100),
+            .socket_path_health_check_interval = std::chrono::milliseconds(60000),
+        }));
 
     std::atomic_bool server_bound = false;
     std::atomic_size_t verify_peer_count = 0;
@@ -751,7 +839,7 @@ int main() {
     auto options = make_options();
     auto peer = std::make_shared<pqrs::unix_domain_stream::impl::peer>(dispatcher,
                                                                        std::move(peer_socket),
-                                                                       options);
+                                                                       options.client);
     std::weak_ptr<pqrs::unix_domain_stream::impl::peer> weak_peer(peer);
 
     peer->async_start();
@@ -879,7 +967,8 @@ int main() {
 
     auto options = make_options();
     std::atomic_bool server_bound = false;
-    std::atomic_bool client_connected = false;
+    std::atomic_size_t client_connected_count = 0;
+    std::atomic_size_t client_closed_count = 0;
     std::atomic_size_t server_request_received_count = 0;
 
     // Accept the request on the server, but intentionally do not respond.
@@ -899,10 +988,13 @@ int main() {
                        server_socket_file_path,
                        options);
     client->connected.connect([&](auto&&) {
-      client_connected = true;
+      ++client_connected_count;
+    });
+    client->closed.connect([&] {
+      ++client_closed_count;
     });
     client->async_start();
-    expect(wait_until([&] { return client_connected.load(); }));
+    expect(wait_until([&] { return client_connected_count.load() == 1_i; }));
 
     std::promise<async_request_test_result> promise;
     auto future = promise.get_future();
@@ -922,8 +1014,141 @@ int main() {
     expect(error_code == asio::error::timed_out);
     expect(response == nullptr);
     expect(server_request_received_count.load() == 1_i);
+
+    // By default, a request timeout invalidates the connection and reconnects.
+    expect(wait_until([&] { return client_closed_count.load() == 1_i; }));
+    expect(wait_until([&] { return client_connected_count.load() == 2_i; }));
     client.reset();
     server.reset();
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
+  "unix_domain_stream::client_async_request_timeout_keeps_connection_when_configured"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::client_async_request_timeout_keeps_connection_when_configured)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto parameters = test_options::make_parameters(
+        {
+            .max_send_queue_size = 128,
+            .write_timeout = std::chrono::milliseconds(1000),
+        },
+        {
+            .reconnect_interval = std::chrono::milliseconds(100),
+            .invalidate_connection_on_request_error = false,
+        },
+        {
+            .bind_retry_interval = std::chrono::milliseconds(100),
+            .socket_path_health_check_interval = std::chrono::milliseconds(60000),
+        });
+    auto options = test_options(parameters);
+
+    std::atomic_bool server_bound = false;
+    std::atomic_size_t client_connected_count = 0;
+    std::atomic_size_t client_closed_count = 0;
+    std::atomic_size_t client_received_count = 0;
+    std::atomic_size_t server_request_received_count = 0;
+
+    // Accept the request without responding, but echo normal user data.
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+    server->request_received.connect([&](auto, auto, auto&&) {
+      ++server_request_received_count;
+    });
+    server->received.connect([&](auto peer_id, auto&& buffer) {
+      server->async_send(peer_id, *buffer);
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
+    client->connected.connect([&](auto&&) {
+      ++client_connected_count;
+    });
+    client->closed.connect([&] {
+      ++client_closed_count;
+    });
+    client->received.connect([&](auto&& buffer) {
+      client_received_count += buffer->size();
+    });
+    client->async_start();
+    expect(wait_until([&] { return client_connected_count.load() == 1_i; }));
+
+    std::promise<async_request_test_result> promise;
+    auto future = promise.get_future();
+
+    client->async_request(std::vector<uint8_t>{1},
+                          std::chrono::milliseconds(100),
+                          [&promise](const auto& error_code, auto response) {
+                            promise.set_value({error_code, response});
+                          });
+
+    expect(future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
+
+    auto [error_code, response] = future.get();
+    expect(error_code == asio::error::timed_out);
+    expect(response == nullptr);
+    expect(server_request_received_count.load() == 1_i);
+
+    // With invalidate_connection_on_request_error disabled, only the request
+    // fails; the underlying stream must remain connected and usable.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    expect(wait_dispatcher_barrier(dispatcher));
+    expect(client_closed_count.load() == 0_i);
+    expect(client_connected_count.load() == 1_i);
+
+    client->async_send(std::vector<uint8_t>(8, 42));
+    expect(wait_until([&] { return client_received_count.load() == 8_i; }));
+
+    client.reset();
+    server.reset();
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
+  "unix_domain_stream::client_async_request_not_connected"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::client_async_request_not_connected)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto options = make_options();
+
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
+
+    std::promise<async_request_test_result> promise;
+    auto future = promise.get_future();
+
+    // Without an active peer, async_request should fail immediately instead of
+    // queueing the request for a future reconnect.
+    client->async_request(std::vector<uint8_t>{1},
+                          [&promise](const auto& error_code, auto response) {
+                            promise.set_value({error_code, response});
+                          });
+
+    expect(future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
+
+    auto [error_code, response] = future.get();
+    expect(error_code == asio::error::not_connected);
+    expect(response == nullptr);
+
+    client.reset();
 
     dispatcher->terminate();
     dispatcher = nullptr;
@@ -1095,13 +1320,18 @@ int main() {
 
     prepare_socket_file_path(server_socket_file_path);
 
-    auto options = pqrs::unix_domain_stream::options(
-        pqrs::unix_domain_stream::options::initialization_parameters{
+    auto options = test_options(test_options::make_parameters(
+        {
             .max_message_size = 8,
             .max_send_queue_size = 128,
-            .reconnect_interval = std::chrono::milliseconds(100),
             .write_timeout = std::chrono::milliseconds(1000),
-        });
+        },
+        {
+            .reconnect_interval = std::chrono::milliseconds(100),
+        },
+        {
+            .bind_retry_interval = std::chrono::milliseconds(100),
+        }));
     std::atomic_bool server_bound = false;
     std::atomic_bool error_occurred = false;
 
@@ -1148,13 +1378,18 @@ int main() {
 
     prepare_socket_file_path(server_socket_file_path);
 
-    auto options = pqrs::unix_domain_stream::options(
-        pqrs::unix_domain_stream::options::initialization_parameters{
+    auto options = test_options(test_options::make_parameters(
+        {
             .max_send_queue_size = 128,
-            .reconnect_interval = std::chrono::milliseconds(100),
-            .server_check_interval = std::chrono::milliseconds(100),
             .write_timeout = std::chrono::milliseconds(1000),
-        });
+        },
+        {
+            .reconnect_interval = std::chrono::milliseconds(100),
+        },
+        {
+            .bind_retry_interval = std::chrono::milliseconds(100),
+            .socket_path_health_check_interval = std::chrono::milliseconds(100),
+        }));
 
     std::atomic<size_t> bound_count = 0;
     std::atomic<size_t> closed_count = 0;
@@ -1231,13 +1466,18 @@ int main() {
 
     prepare_socket_file_path(server_socket_file_path);
 
-    auto options = pqrs::unix_domain_stream::options(
-        pqrs::unix_domain_stream::options::initialization_parameters{
+    auto options = test_options(test_options::make_parameters(
+        {
             .max_send_queue_size = 128,
-            .reconnect_interval = std::chrono::milliseconds(100),
             .read_timeout = std::chrono::milliseconds(200),
             .write_timeout = std::chrono::milliseconds(1000),
-        });
+        },
+        {
+            .reconnect_interval = std::chrono::milliseconds(100),
+        },
+        {
+            .bind_retry_interval = std::chrono::milliseconds(100),
+        }));
 
     std::atomic_bool server_bound = false;
     std::atomic_bool peer_error_occurred = false;
@@ -1287,14 +1527,19 @@ int main() {
 
     prepare_socket_file_path(server_socket_file_path);
 
-    auto options = pqrs::unix_domain_stream::options(
-        pqrs::unix_domain_stream::options::initialization_parameters{
+    auto options = test_options(test_options::make_parameters(
+        {
             .max_message_size = 8,
             .max_send_queue_size = 128,
-            .reconnect_interval = std::chrono::milliseconds(100),
             .read_timeout = std::chrono::milliseconds(1000),
             .write_timeout = std::chrono::milliseconds(1000),
-        });
+        },
+        {
+            .reconnect_interval = std::chrono::milliseconds(100),
+        },
+        {
+            .bind_retry_interval = std::chrono::milliseconds(100),
+        }));
 
     std::atomic_bool server_bound = false;
     std::atomic_size_t peer_connected_count = 0;
@@ -1374,7 +1619,7 @@ int main() {
     // The declared body size must fit within the configured payload limit.
     // This rejects oversized frames before allocating a matching read buffer.
     send_malformed_frame({
-        .frame = make_raw_frame(options.max_message_size +
+        .frame = make_raw_frame(options.server.max_message_size +
                                     pqrs::unix_domain_stream::impl::protocol::type_size +
                                     pqrs::unix_domain_stream::impl::protocol::request_id_size +
                                     1,
@@ -1426,15 +1671,20 @@ int main() {
 
     prepare_socket_file_path(server_socket_file_path);
 
-    auto options = pqrs::unix_domain_stream::options(
-        pqrs::unix_domain_stream::options::initialization_parameters{
+    auto options = test_options(test_options::make_parameters(
+        {
             .max_send_queue_size = 128,
-            .reconnect_interval = std::chrono::milliseconds(100),
             .heartbeat_interval = std::chrono::milliseconds(1000),
             .heartbeat_timeout = std::chrono::milliseconds(300),
             .read_timeout = std::chrono::milliseconds(1000),
             .write_timeout = std::chrono::milliseconds(1000),
-        });
+        },
+        {
+            .reconnect_interval = std::chrono::milliseconds(100),
+        },
+        {
+            .bind_retry_interval = std::chrono::milliseconds(100),
+        }));
 
     std::atomic_bool server_bound = false;
     std::atomic_bool peer_connected = false;
@@ -1486,14 +1736,19 @@ int main() {
 
     prepare_socket_file_path(server_socket_file_path);
 
-    auto options = pqrs::unix_domain_stream::options(
-        pqrs::unix_domain_stream::options::initialization_parameters{
+    auto options = test_options(test_options::make_parameters(
+        {
             .max_send_queue_size = 128,
-            .reconnect_interval = std::chrono::milliseconds(100),
             .heartbeat_interval = std::chrono::milliseconds(50),
             .heartbeat_timeout = std::chrono::milliseconds(300),
             .write_timeout = std::chrono::milliseconds(1000),
-        });
+        },
+        {
+            .reconnect_interval = std::chrono::milliseconds(100),
+        },
+        {
+            .bind_retry_interval = std::chrono::milliseconds(100),
+        }));
 
     std::atomic<size_t> server_received_count = 0;
     std::atomic<size_t> client_received_count = 0;

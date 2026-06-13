@@ -1199,6 +1199,48 @@ int main() {
     dispatcher = nullptr;
   };
 
+  "unix_domain_stream::client_reconnect_interval"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::client_reconnect_interval)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto options = test_options(test_options::make_parameters(
+        {},
+        {
+            .reconnect_interval = std::chrono::milliseconds(100),
+        },
+        {
+            .bind_retry_interval = std::chrono::milliseconds(100),
+        }));
+
+    std::atomic_size_t connect_failed_count = 0;
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
+    client->connect_failed.connect([&](auto&& error_code) {
+      expect(static_cast<bool>(error_code));
+      ++connect_failed_count;
+    });
+    client->async_start();
+
+    expect(wait_until([&] { return connect_failed_count.load() >= 3_i; },
+                      std::chrono::milliseconds(1000)));
+
+    // A missing server should retry at reconnect_interval pace, not spin in a
+    // tight connect_failed loop.
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    expect(wait_dispatcher_barrier(dispatcher));
+    expect(connect_failed_count.load() <= 8_i);
+
+    client.reset();
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
   "unix_domain_stream::client_reconnect"_test = [] {
     std::cout << "TEST_CASE(unix_domain_stream::client_reconnect)" << std::endl;
 

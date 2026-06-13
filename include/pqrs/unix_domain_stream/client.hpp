@@ -49,7 +49,6 @@ public:
         socket_file_path_(socket_file_path),
         options_(options),
         verify_peer_(verify_peer),
-        reconnect_timer_(*this),
         work_guard_(asio::make_work_guard(io_ctx_)) {
     io_ctx_thread_ = std::thread([this] {
       io_ctx_.run();
@@ -135,7 +134,7 @@ private:
   // This method is executed in the dispatcher thread.
   void stop() {
     stopped_ = true;
-    reconnect_timer_.stop();
+    ++reconnect_generation_;
 
     asio::post(io_ctx_,
                [this] {
@@ -199,7 +198,7 @@ private:
 
   // This method is executed in the dispatcher thread.
   void invalidate_connection() {
-    reconnect_timer_.stop();
+    ++reconnect_generation_;
 
     asio::post(io_ctx_,
                [this] {
@@ -333,15 +332,23 @@ private:
 
   // This method is executed in the dispatcher thread.
   void start_reconnect_timer() {
+    ++reconnect_generation_;
+
     if (stopped_) {
       return;
     }
 
-    reconnect_timer_.start(
-        [this] {
+    auto generation = reconnect_generation_;
+    enqueue_to_dispatcher(
+        [this, generation] {
+          if (stopped_ ||
+              reconnect_generation_ != generation) {
+            return;
+          }
+
           connect();
         },
-        options_.reconnect_interval);
+        when_now() + options_.reconnect_interval);
   }
 
   // This method is executed in `io_ctx_thread_`.
@@ -424,8 +431,8 @@ private:
   std::filesystem::path socket_file_path_;
   client_options options_;
   std::function<bool(const peer_credentials&)> verify_peer_;
-  dispatcher::extra::timer reconnect_timer_;
   std::atomic_bool stopped_ = true;
+  int reconnect_generation_ = 0;
 
   asio::io_context io_ctx_;
   asio::executor_work_guard<asio::io_context::executor_type> work_guard_;

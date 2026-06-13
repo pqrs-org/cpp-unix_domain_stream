@@ -595,6 +595,51 @@ int main() {
     dispatcher = nullptr;
   };
 
+  "unix_domain_stream::server_bind_retry_interval"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::server_bind_retry_interval)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    const auto missing_parent_socket_file_path = std::filesystem::path("tmp/missing-parent/server.sock");
+    std::error_code error_code;
+    std::filesystem::remove_all(missing_parent_socket_file_path.parent_path(), error_code);
+
+    auto options = test_options(test_options::make_parameters(
+        {},
+        {
+            .reconnect_interval = std::chrono::milliseconds(100),
+        },
+        {
+            .bind_retry_interval = std::chrono::milliseconds(100),
+            .socket_path_health_check_interval = std::chrono::milliseconds(60000),
+        }));
+
+    std::atomic_size_t bind_failed_count = 0;
+    test_server server(dispatcher,
+                       missing_parent_socket_file_path,
+                       options);
+    server->bind_failed.connect([&](auto&& error_code) {
+      expect(static_cast<bool>(error_code));
+      ++bind_failed_count;
+    });
+    server->async_start();
+
+    expect(wait_until([&] { return bind_failed_count.load() >= 3_i; },
+                      std::chrono::milliseconds(1000)));
+
+    // A missing parent directory should retry at bind_retry_interval pace, not
+    // spin in a tight bind_failed loop.
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    expect(wait_dispatcher_barrier(dispatcher));
+    expect(bind_failed_count.load() <= 8_i);
+
+    server.reset();
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
   "unix_domain_stream::verify_peer_runs_on_dispatcher"_test = [] {
     std::cout << "TEST_CASE(unix_domain_stream::verify_peer_runs_on_dispatcher)" << std::endl;
 

@@ -116,7 +116,7 @@ public:
 private:
   // This method is executed in `io_ctx_thread_`.
   void start_heartbeat_timer() {
-    heartbeat_timer_.expires_after(options_.heartbeat_interval);
+    heartbeat_timer_.expires_after(normalize_scheduling_interval(options_.heartbeat_interval));
 
     heartbeat_timer_.async_wait([self = shared_from_this()](const auto& error_code) {
       if (!error_code &&

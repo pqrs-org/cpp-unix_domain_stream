@@ -360,7 +360,7 @@ private:
 
           connect();
         },
-        when_now() + options_.reconnect_interval);
+        when_now() + impl::normalize_scheduling_interval(options_.reconnect_interval));
   }
 
   // This method is executed in `io_ctx_thread_`.

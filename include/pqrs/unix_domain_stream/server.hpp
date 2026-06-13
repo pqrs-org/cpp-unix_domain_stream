@@ -325,7 +325,7 @@ private:
 
           bind();
         },
-        when_now() + options_.bind_retry_interval);
+        when_now() + impl::normalize_scheduling_interval(options_.bind_retry_interval));
   }
 
   // This method is executed in the dispatcher thread.
@@ -338,7 +338,7 @@ private:
         [this] {
           socket_path_health_check();
         },
-        options_.socket_path_health_check_interval);
+        impl::normalize_scheduling_interval(options_.socket_path_health_check_interval));
   }
 
   // This method is executed in the dispatcher thread.

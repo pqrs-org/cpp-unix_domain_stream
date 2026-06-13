@@ -1457,8 +1457,8 @@ int main() {
     dispatcher = nullptr;
   };
 
-  "unix_domain_stream::server_check"_test = [] {
-    std::cout << "TEST_CASE(unix_domain_stream::server_check)" << std::endl;
+  "unix_domain_stream::server_socket_path_health_check"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::server_socket_path_health_check)" << std::endl;
 
     auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
     auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);

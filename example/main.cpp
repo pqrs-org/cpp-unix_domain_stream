@@ -9,12 +9,12 @@ auto global_wait = pqrs::make_thread_wait();
 
 class example_app final {
 public:
-  example_app(std::shared_ptr<pqrs::dispatcher::dispatcher> dispatcher,
+  example_app(pqrs::not_null_shared_ptr_t<pqrs::dispatcher::dispatcher> dispatcher,
               const std::filesystem::path& server_socket_file_path,
               const pqrs::unix_domain_stream::server_options& server_options,
               const pqrs::unix_domain_stream::client_options& client_options)
       : server_(std::make_unique<pqrs::unix_domain_stream::server>(
-            dispatcher,
+            dispatcher.get(),
             server_socket_file_path,
             server_options,
             [](const auto& credentials) {
@@ -22,7 +22,7 @@ public:
               example_app::output_peer_credentials(credentials);
               return true;
             })),
-        client_(std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
+        client_(std::make_unique<pqrs::unix_domain_stream::client>(dispatcher.get(),
                                                                    server_socket_file_path,
                                                                    client_options)) {
     server_->bound.connect([this] {

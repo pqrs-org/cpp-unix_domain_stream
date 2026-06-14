@@ -93,9 +93,9 @@ void prepare_socket_file_path(const std::filesystem::path& path) {
   std::filesystem::remove(path, error_code);
 }
 
-bool wait_dispatcher_barrier(const std::shared_ptr<pqrs::dispatcher::dispatcher>& dispatcher,
+bool wait_dispatcher_barrier(pqrs::not_null_shared_ptr_t<pqrs::dispatcher::dispatcher> dispatcher,
                              std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
-  pqrs::dispatcher::extra::dispatcher_client barrier(dispatcher);
+  pqrs::dispatcher::extra::dispatcher_client barrier(dispatcher.get());
   auto promise = std::make_shared<std::promise<void>>();
   auto future = promise->get_future();
 
@@ -328,14 +328,14 @@ int main() {
     auto outbound_payload = std::make_shared<std::vector<uint8_t>>(payload_size, 42);
 
     struct active_write_server final {
-      active_write_server(std::shared_ptr<pqrs::dispatcher::dispatcher> dispatcher,
+      active_write_server(pqrs::not_null_shared_ptr_t<pqrs::dispatcher::dispatcher> dispatcher,
                           const test_options& options,
                           std::atomic_bool& server_bound,
                           std::atomic_size_t& peer_connected_count,
                           std::atomic_size_t& server_received_count,
                           size_t send_count_per_peer,
-                          std::shared_ptr<std::vector<uint8_t>> outbound_payload)
-          : server_(std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
+                          pqrs::not_null_shared_ptr_t<std::vector<uint8_t>> outbound_payload)
+          : server_(std::make_unique<pqrs::unix_domain_stream::server>(dispatcher.get(),
                                                                        server_socket_file_path,
                                                                        options)),
             server_ptr_(server_.get()),
@@ -373,7 +373,7 @@ int main() {
       std::atomic_size_t& peer_connected_count_;
       std::atomic_size_t& server_received_count_;
       size_t send_count_per_peer_;
-      std::shared_ptr<std::vector<uint8_t>> outbound_payload_;
+      pqrs::not_null_shared_ptr_t<std::vector<uint8_t>> outbound_payload_;
     };
 
     auto server = std::make_unique<active_write_server>(dispatcher,

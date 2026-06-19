@@ -23,7 +23,7 @@
 
 namespace pqrs::unix_domain_stream {
 
-inline bool default_client_verify_peer(const peer_credentials&) {
+[[nodiscard]] inline bool default_client_verify_peer(const peer_credentials&) noexcept {
   return true;
 }
 

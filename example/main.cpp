@@ -100,6 +100,10 @@ public:
     client_->connect_failed.connect([](auto&& error_code) {
       std::cout << "client connect_failed:" << error_code.message() << std::endl;
     });
+    client_->peer_verification_failed.connect([](auto&& credentials) {
+      std::cout << "client peer_verification_failed" << std::endl;
+      example_app::output_peer_credentials(credentials);
+    });
     client_->closed.connect([] {
       std::cout << "client closed" << std::endl;
     });
@@ -109,6 +113,14 @@ public:
     client_->received.connect([](auto&& buffer) {
       std::cout << "client received size:" << buffer->size() << std::endl;
       example_app::output_received_data(buffer);
+    });
+    client_->request_received.connect([this](auto request_id, auto&& buffer) {
+      std::cout << "client request_received request_id:" << request_id << " size:" << buffer->size() << std::endl;
+      output_received_data(buffer);
+
+      auto response = make_buffer("response for ");
+      response.insert(std::end(response), std::begin(*buffer), std::end(*buffer));
+      client_->async_respond(request_id, response);
     });
   }
 

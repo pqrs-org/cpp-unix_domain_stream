@@ -1295,6 +1295,422 @@ int main() {
     dispatcher = nullptr;
   };
 
+  "unix_domain_stream::server_async_request"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::server_async_request)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto options = make_options();
+    std::atomic_bool server_bound = false;
+    std::atomic_bool client_connected = false;
+    std::atomic<pqrs::unix_domain_stream::peer_id> connected_peer_id = 0;
+
+    // Start the server and remember the peer id assigned to the client.
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+    server->peer_connected.connect([&](auto peer_id, auto&&) {
+      connected_peer_id = peer_id;
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+
+    pqrs::unix_domain_stream::request_id first_request_id = 0;
+
+    // Connect one client and make it respond to the two requests out of order.
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
+    client->connected.connect([&](auto&&) {
+      client_connected = true;
+    });
+    // Delay the response to request 1 until request 2 arrives, to confirm
+    // server-side responses are matched by request_id rather than completion order.
+    client->request_received.connect([&](auto request_id, auto&& buffer) {
+      if (buffer->at(0) == 1) {
+        first_request_id = request_id;
+        return;
+      }
+
+      client->async_respond(request_id, std::vector<uint8_t>{20});
+      client->async_respond(first_request_id, std::vector<uint8_t>{10});
+    });
+    client->async_start();
+    expect(wait_until([&] { return client_connected.load(); }));
+    expect(wait_until([&] { return connected_peer_id.load() != 0_i; }));
+
+    std::promise<async_request_test_result> promise1;
+    std::promise<async_request_test_result> promise2;
+    auto future1 = promise1.get_future();
+    auto future2 = promise2.get_future();
+
+    // Send two concurrent server-side requests to the same peer.
+    server->async_request(connected_peer_id,
+                          std::vector<uint8_t>{1},
+                          [&promise1](const auto& error_code, auto response) {
+                            promise1.set_value({error_code, response});
+                          });
+    server->async_request(connected_peer_id,
+                          std::vector<uint8_t>{2},
+                          [&promise2](const auto& error_code, auto response) {
+                            promise2.set_value({error_code, response});
+                          });
+
+    // Both callbacks should complete even though the responses arrive in reverse order.
+    expect(future1.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
+    expect(future2.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
+
+    auto [error_code1, response1] = future1.get();
+    auto [error_code2, response2] = future2.get();
+
+    expect(!error_code1);
+    expect(!error_code2);
+    expect(response1 != nullptr);
+    expect(response2 != nullptr);
+    // Each callback should receive the response for its own request_id.
+    expect(*response1 == std::vector<uint8_t>{10});
+    expect(*response2 == std::vector<uint8_t>{20});
+    client.reset();
+    server.reset();
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
+  "unix_domain_stream::server_async_request_ignores_response_from_other_peer"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::server_async_request_ignores_response_from_other_peer)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto options = make_options();
+    std::atomic_bool server_bound = false;
+    std::atomic_bool target_client_connected = false;
+    std::atomic_bool other_client_connected = false;
+    std::atomic<pqrs::unix_domain_stream::peer_id> target_peer_id = 0;
+    std::atomic<pqrs::unix_domain_stream::peer_id> other_peer_id = 0;
+
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+    server->peer_connected.connect([&](auto peer_id, auto&&) {
+      if (target_peer_id == 0) {
+        target_peer_id = peer_id;
+      } else {
+        other_peer_id = peer_id;
+      }
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+
+    std::atomic_size_t target_request_received_count = 0;
+    std::atomic<pqrs::unix_domain_stream::request_id> target_request_id = 0;
+
+    // The target client receives the request but intentionally does not respond.
+    test_client target_client(dispatcher,
+                              server_socket_file_path,
+                              options);
+    target_client->connected.connect([&](auto&&) {
+      target_client_connected = true;
+    });
+    target_client->request_received.connect([&](auto request_id, auto&&) {
+      target_request_id = request_id;
+      ++target_request_received_count;
+    });
+    target_client->async_start();
+    expect(wait_until([&] { return target_client_connected.load(); }));
+    expect(wait_until([&] { return target_peer_id.load() != 0_i; }));
+
+    // The other client will try to complete the target client's request_id.
+    test_client other_client(dispatcher,
+                             server_socket_file_path,
+                             options);
+    other_client->connected.connect([&](auto&&) {
+      other_client_connected = true;
+    });
+    other_client->async_start();
+    expect(wait_until([&] { return other_client_connected.load(); }));
+    expect(wait_until([&] { return other_peer_id.load() != 0_i; }));
+
+    std::promise<async_request_test_result> promise;
+    auto future = promise.get_future();
+
+    server->async_request(target_peer_id,
+                          std::vector<uint8_t>{1},
+                          [&promise](const auto& error_code, auto response) {
+                            promise.set_value({error_code, response});
+                          });
+
+    expect(wait_until([&] { return target_request_received_count.load() == 1_i; }));
+
+    // A response from a different peer with the same request_id must be ignored.
+    other_client->async_respond(target_request_id, std::vector<uint8_t>{99});
+
+    auto status = future.wait_for(std::chrono::milliseconds(300));
+    expect(status == std::future_status::timeout);
+
+    if (status == std::future_status::ready) {
+      future.get();
+    } else {
+      server->async_close_peer(target_peer_id);
+      expect(future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
+
+      auto [error_code, response] = future.get();
+      expect(error_code == asio::error::operation_aborted);
+      expect(response == nullptr);
+    }
+
+    other_client.reset();
+    target_client.reset();
+    server.reset();
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
+  "unix_domain_stream::server_async_request_timeout"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::server_async_request_timeout)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto options = make_options();
+    std::atomic_bool server_bound = false;
+    std::atomic_bool client_connected = false;
+    std::atomic_size_t client_request_received_count = 0;
+    std::atomic<pqrs::unix_domain_stream::peer_id> connected_peer_id = 0;
+
+    // Start the server and remember the peer id assigned to the client.
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+    server->peer_connected.connect([&](auto peer_id, auto&&) {
+      connected_peer_id = peer_id;
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+
+    // Connect one client so the server has a target peer for async_request.
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
+    client->connected.connect([&](auto&&) {
+      client_connected = true;
+    });
+    client->request_received.connect([&](auto, auto&&) {
+      ++client_request_received_count;
+    });
+    client->async_start();
+    expect(wait_until([&] { return client_connected.load(); }));
+    expect(wait_until([&] { return connected_peer_id.load() != 0_i; }));
+
+    std::promise<async_request_test_result> promise;
+    auto future = promise.get_future();
+
+    // Send a server-side request, but do not respond from the client.
+    server->async_request(connected_peer_id,
+                          std::vector<uint8_t>{1},
+                          std::chrono::milliseconds(100),
+                          [&promise](const auto& error_code, auto response) {
+                            promise.set_value({error_code, response});
+                          });
+
+    // The callback should complete when the request timeout expires.
+    expect(future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
+
+    auto [error_code, response] = future.get();
+    expect(error_code == asio::error::timed_out);
+    expect(response == nullptr);
+    // The timeout is local to the server; the client still received the request.
+    expect(client_request_received_count.load() == 1_i);
+    client.reset();
+    server.reset();
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
+  "unix_domain_stream::server_async_request_close_peer"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::server_async_request_close_peer)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto options = make_options();
+    std::atomic_bool server_bound = false;
+    std::atomic_bool client_connected = false;
+    std::atomic<pqrs::unix_domain_stream::peer_id> connected_peer_id = 0;
+
+    // Start the server and remember the peer id assigned to the client.
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+    server->peer_connected.connect([&](auto peer_id, auto&&) {
+      connected_peer_id = peer_id;
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+
+    // Connect one client so the server has a target peer for async_request.
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
+    client->connected.connect([&](auto&&) {
+      client_connected = true;
+    });
+    client->async_start();
+    expect(wait_until([&] { return client_connected.load(); }));
+    expect(wait_until([&] { return connected_peer_id.load() != 0_i; }));
+
+    std::promise<async_request_test_result> promise;
+    auto future = promise.get_future();
+
+    // Send a server-side request and leave it pending.
+    server->async_request(connected_peer_id,
+                          std::vector<uint8_t>{1},
+                          [&promise](const auto& error_code, auto response) {
+                            promise.set_value({error_code, response});
+                          });
+
+    // Closing the peer locally should complete the pending request.
+    server->async_close_peer(connected_peer_id);
+
+    // The callback should report the local close as operation_aborted.
+    expect(future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
+
+    auto [error_code, response] = future.get();
+    expect(error_code == asio::error::operation_aborted);
+    expect(response == nullptr);
+    client.reset();
+    server.reset();
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
+  "unix_domain_stream::server_async_request_peer_closed"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::server_async_request_peer_closed)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto options = make_options();
+    std::atomic_bool server_bound = false;
+    std::atomic_bool client_connected = false;
+    std::atomic_size_t client_request_received_count = 0;
+    std::atomic<pqrs::unix_domain_stream::peer_id> connected_peer_id = 0;
+
+    // Start the server and remember the peer id assigned to the client.
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
+    server->bound.connect([&] {
+      server_bound = true;
+    });
+    server->peer_connected.connect([&](auto peer_id, auto&&) {
+      connected_peer_id = peer_id;
+    });
+    server->async_start();
+    expect(wait_until([&] { return server_bound.load(); }));
+
+    // Connect one client and count server-side requests that reach it.
+    test_client client(dispatcher,
+                       server_socket_file_path,
+                       options);
+    client->connected.connect([&](auto&&) {
+      client_connected = true;
+    });
+    client->request_received.connect([&](auto, auto&&) {
+      ++client_request_received_count;
+    });
+    client->async_start();
+    expect(wait_until([&] { return client_connected.load(); }));
+    expect(wait_until([&] { return connected_peer_id.load() != 0_i; }));
+
+    std::promise<async_request_test_result> promise;
+    auto future = promise.get_future();
+
+    // Send a server-side request and leave it pending on the client.
+    server->async_request(connected_peer_id,
+                          std::vector<uint8_t>{1},
+                          [&promise](const auto& error_code, auto response) {
+                            promise.set_value({error_code, response});
+                          });
+
+    // Close the remote peer after it has received the request but before it responds.
+    expect(wait_until([&] { return client_request_received_count.load() == 1_i; }));
+    client.reset();
+
+    // The callback should report the remote close as connection_reset.
+    expect(future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
+
+    auto [error_code, response] = future.get();
+    expect(error_code == asio::error::connection_reset);
+    expect(response == nullptr);
+    server.reset();
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
+  "unix_domain_stream::server_async_request_not_connected"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::server_async_request_not_connected)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    auto options = make_options();
+
+    test_server server(dispatcher,
+                       server_socket_file_path,
+                       options);
+
+    std::promise<async_request_test_result> promise;
+    auto future = promise.get_future();
+
+    server->async_request(1,
+                          std::vector<uint8_t>{1},
+                          [&promise](const auto& error_code, auto response) {
+                            promise.set_value({error_code, response});
+                          });
+
+    expect(future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);
+
+    auto [error_code, response] = future.get();
+    expect(error_code == asio::error::not_connected);
+    expect(response == nullptr);
+
+    server.reset();
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
   "unix_domain_stream::client_reconnect_interval"_test = [] {
     std::cout << "TEST_CASE(unix_domain_stream::client_reconnect_interval)" << std::endl;
 

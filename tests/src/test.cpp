@@ -8,11 +8,14 @@
 #include <pqrs/unix_domain_stream.hpp>
 #include <pqrs/unix_domain_stream/impl/protocol.hpp>
 #include <thread>
+#include <unistd.h>
 #include <utility>
 
 namespace {
 
-const std::filesystem::path server_socket_file_path("tmp/server.sock");
+const std::filesystem::path server_socket_file_path =
+    std::filesystem::path("tmp") /
+    ("server-" + std::to_string(::getpid()) + ".sock");
 
 using async_request_test_result = std::pair<asio::error_code, std::shared_ptr<std::vector<uint8_t>>>;
 

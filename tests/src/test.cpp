@@ -1019,6 +1019,47 @@ int main() {
     dispatcher = nullptr;
   };
 
+  "unix_domain_stream::peer_close_cancels_timers_when_socket_is_closed"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::peer_close_cancels_timers_when_socket_is_closed)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    asio::io_context io_ctx;
+    auto work_guard = asio::make_work_guard(io_ctx);
+    std::thread io_ctx_thread([&] {
+      io_ctx.run();
+    });
+
+    auto options = make_options();
+    options.client.heartbeat_interval = std::chrono::milliseconds(1000);
+    options.client.heartbeat_timeout = std::chrono::milliseconds(1000);
+
+    // A default-constructed socket is already closed. async_start still arms
+    // the peer timers, so async_close must cancel them even though there is no
+    // socket to close.
+    asio::local::stream_protocol::socket socket(io_ctx);
+    auto peer = std::make_shared<pqrs::unix_domain_stream::impl::peer>(dispatcher,
+                                                                       std::move(socket),
+                                                                       options.client);
+    std::weak_ptr<pqrs::unix_domain_stream::impl::peer> weak_peer(peer);
+
+    peer->async_start();
+    peer->async_close();
+    peer.reset();
+
+    expect(wait_until([&] { return weak_peer.expired(); },
+                      std::chrono::milliseconds(300)));
+
+    work_guard.reset();
+    if (io_ctx_thread.joinable()) {
+      io_ctx_thread.join();
+    }
+
+    dispatcher->terminate();
+    dispatcher = nullptr;
+  };
+
   "unix_domain_stream::client_async_request"_test = [] {
     std::cout << "TEST_CASE(unix_domain_stream::client_async_request)" << std::endl;
 

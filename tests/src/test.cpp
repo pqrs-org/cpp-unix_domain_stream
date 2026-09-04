@@ -11,6 +11,17 @@
 #include <unistd.h>
 #include <utility>
 
+namespace pqrs::unix_domain_stream::impl {
+
+class runtime_test_access final {
+public:
+  [[nodiscard]] static asio::io_context& get_io_context() {
+    return runtime::get_io_context();
+  }
+};
+
+} // namespace pqrs::unix_domain_stream::impl
+
 namespace {
 
 const std::filesystem::path server_socket_file_path =
@@ -227,6 +238,150 @@ int main() {
     expect(server_options.read_timeout == std::chrono::milliseconds(678));
     expect(server_options.write_timeout == std::chrono::milliseconds(890));
     expect(server_options.invalidate_connection_on_request_error == false);
+  };
+
+  "unix_domain_stream::destruction_does_not_wait_for_io_context"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::destruction_does_not_wait_for_io_context)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    auto io_context_is_blocked_promise = std::make_shared<std::promise<void>>();
+    auto io_context_is_blocked_future = io_context_is_blocked_promise->get_future();
+    auto release_io_context_promise = std::make_shared<std::promise<void>>();
+    auto release_io_context_future = release_io_context_promise->get_future().share();
+
+    asio::post(
+        pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(),
+        [io_context_is_blocked_promise, release_io_context_future] {
+          io_context_is_blocked_promise->set_value();
+          release_io_context_future.wait();
+        });
+
+    if (io_context_is_blocked_future.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
+      expect(false);
+      release_io_context_promise->set_value();
+      return;
+    }
+
+    auto destruction_future = std::async(std::launch::async, [dispatcher] {
+      pqrs::unix_domain_stream::client client(dispatcher,
+                                              server_socket_file_path,
+                                              make_options());
+      pqrs::unix_domain_stream::server server(dispatcher,
+                                              server_socket_file_path,
+                                              make_options());
+    });
+
+    // Destruction must complete while the I/O runtime remains blocked. Check it
+    // from this thread so a regression does not deadlock the test process.
+    auto destruction_status = destruction_future.wait_for(std::chrono::milliseconds(500));
+
+    release_io_context_promise->set_value();
+
+    expect(destruction_status == std::future_status::ready);
+    destruction_future.get();
+
+    auto promise = std::make_shared<std::promise<void>>();
+    auto future = promise->get_future();
+    asio::post(
+        pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(),
+        [promise] {
+          promise->set_value();
+        });
+    expect(future.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+
+    // The shutdown handlers above enqueue one final lifetime barrier. Wait for
+    // that barrier as well before terminating their dispatcher.
+    auto lifetime_barrier_promise = std::make_shared<std::promise<void>>();
+    auto lifetime_barrier_future = lifetime_barrier_promise->get_future();
+    asio::post(
+        pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(),
+        [lifetime_barrier_promise] {
+          lifetime_barrier_promise->set_value();
+        });
+    expect(lifetime_barrier_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+
+    dispatcher->terminate();
+  };
+
+  "unix_domain_stream::old_server_shutdown_does_not_remove_new_server_socket_path"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::old_server_shutdown_does_not_remove_new_server_socket_path)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+
+    prepare_socket_file_path(server_socket_file_path);
+
+    std::atomic_bool old_server_bound = false;
+    auto old_server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
+                                                                         server_socket_file_path,
+                                                                         make_options());
+    old_server->bound.connect([&old_server_bound] {
+      old_server_bound = true;
+    });
+    old_server->async_start();
+    expect(wait_until([&old_server_bound] { return old_server_bound.load(); }));
+
+    auto io_context_is_blocked_promise = std::make_shared<std::promise<void>>();
+    auto io_context_is_blocked_future = io_context_is_blocked_promise->get_future();
+    auto release_io_context_promise = std::make_shared<std::promise<void>>();
+    auto release_io_context_future = release_io_context_promise->get_future().share();
+
+    asio::post(
+        pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(),
+        [io_context_is_blocked_promise, release_io_context_future] {
+          io_context_is_blocked_promise->set_value();
+          release_io_context_future.wait();
+        });
+    expect(io_context_is_blocked_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+
+    std::atomic_bool new_server_bound = false;
+    auto equivalent_server_socket_file_path = server_socket_file_path.parent_path() /
+                                              "." /
+                                              server_socket_file_path.filename();
+    expect(equivalent_server_socket_file_path != server_socket_file_path);
+    expect(equivalent_server_socket_file_path.lexically_normal() == server_socket_file_path);
+
+    auto new_server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher,
+                                                                         equivalent_server_socket_file_path,
+                                                                         make_options());
+    new_server->bound.connect([&new_server_bound] {
+      new_server_bound = true;
+    });
+    new_server->async_start();
+
+    // Ensure the new bind is queued before the old server queues its delayed
+    // shutdown on the blocked I/O runtime.
+    expect(wait_dispatcher_barrier(dispatcher));
+    old_server.reset();
+    release_io_context_promise->set_value();
+
+    expect(wait_until([&new_server_bound] { return new_server_bound.load(); }));
+
+    auto io_context_barrier_promise = std::make_shared<std::promise<void>>();
+    auto io_context_barrier_future = io_context_barrier_promise->get_future();
+    asio::post(
+        pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(),
+        [io_context_barrier_promise] {
+          io_context_barrier_promise->set_value();
+        });
+    expect(io_context_barrier_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+    expect(std::filesystem::exists(server_socket_file_path));
+
+    std::atomic_bool client_connected = false;
+    auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher,
+                                                                     equivalent_server_socket_file_path,
+                                                                     make_options());
+    client->connected.connect([&client_connected](auto&&) {
+      client_connected = true;
+    });
+    client->async_start();
+    expect(wait_until([&client_connected] { return client_connected.load(); }));
+
+    client.reset();
+    new_server.reset();
+    dispatcher->terminate();
   };
 
   "unix_domain_stream::client_server"_test = [] {

@@ -268,6 +268,61 @@ int main() {
   using namespace boost::ut;
   using namespace boost::ut::literals;
 
+  "unix_domain_stream::request_manager_ignores_completed_request_timeout"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::request_manager_ignores_completed_request_timeout)" << std::endl;
+
+    enum class completion { response,
+                            peer_closed,
+                            stopped,
+                            timeout };
+    for (auto mode : {completion::response, completion::peer_closed, completion::stopped, completion::timeout}) {
+      auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+      auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+      pqrs::dispatcher::extra::dispatcher_client owner(dispatcher);
+      asio::io_context io_ctx;
+      pqrs::unix_domain_stream::impl::request_manager requests(io_ctx, owner);
+      pqrs::unix_domain_stream::request_id id = 0;
+      size_t timeout_actions = 0;
+      std::atomic_size_t results = 0;
+      asio::error_code result;
+
+      // Both timers have expired before run(). The earlier handler completes
+      // the request while its successful timeout handler is already queued,
+      // reproducing the case where cancel() can no longer suppress that handler.
+      asio::steady_timer earlier(io_ctx);
+      earlier.expires_at(asio::steady_timer::clock_type::now() - std::chrono::hours(1));
+      earlier.async_wait([&](const auto&) {
+        switch (mode) {
+          case completion::response:
+            requests.complete(id, {}, nullptr);
+            break;
+          case completion::peer_closed:
+            requests.complete_peer(1, asio::error::connection_reset);
+            break;
+          case completion::stopped:
+            requests.complete_all(asio::error::operation_aborted);
+            break;
+          case completion::timeout:
+            break;
+        }
+      });
+      id = requests.add(1, std::chrono::milliseconds(-1), [&](const auto& error_code, auto) {
+                          result = error_code;
+                          ++results; }, [&] { ++timeout_actions; });
+      io_ctx.run();
+      expect(wait_dispatcher_barrier(dispatcher));
+      expect(results.load() == 1);
+      // A genuinely pending request must still time out and run its close action.
+      auto expected = mode == completion::response ? asio::error_code{} : mode == completion::peer_closed ? asio::error::make_error_code(asio::error::connection_reset)
+                                                                      : mode == completion::stopped       ? asio::error::make_error_code(asio::error::operation_aborted)
+                                                                                                          : asio::error::make_error_code(asio::error::timed_out);
+      expect(result == expected);
+      expect(timeout_actions == (mode == completion::timeout ? 1u : 0u));
+      owner.detach_from_dispatcher();
+      dispatcher->terminate();
+    }
+  };
+
   "unix_domain_stream::options_initialization_parameters"_test = [] {
     std::cout << "TEST_CASE(unix_domain_stream::options_initialization_parameters)" << std::endl;
 

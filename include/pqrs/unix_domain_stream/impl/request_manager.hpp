@@ -38,7 +38,9 @@ public:
     not_null_shared_ptr_t<asio::steady_timer> timer(std::make_shared<asio::steady_timer>(io_ctx_));
     timer->expires_after(timeout);
     timer->async_wait([this, id, timeout_callback](const auto& error_code) {
-      if (!error_code) {
+      // An expired timer may already be queued when completion cancels it.
+      // Only a request that is still pending may trigger timeout side effects.
+      if (!error_code && pending_requests_.contains(id)) {
         complete(id,
                  asio::error::timed_out,
                  nullptr);

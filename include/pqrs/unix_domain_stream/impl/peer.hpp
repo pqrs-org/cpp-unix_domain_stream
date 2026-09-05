@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <nod/nod.hpp>
 #include <pqrs/dispatcher.hpp>
 #include <pqrs/gsl.hpp>
@@ -73,11 +74,15 @@ public:
         });
   }
 
-  void async_close() {
+  // The completion runs on the socket executor after the socket is closed.
+  void async_close(std::function<void()> completion = nullptr) {
     asio::post(
         socket_.get_executor(),
-        [self = shared_from_this()] {
+        [self = shared_from_this(), completion = std::move(completion)] {
           self->close();
+          if (completion) {
+            completion();
+          }
         });
   }
 

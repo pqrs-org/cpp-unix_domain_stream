@@ -211,6 +211,8 @@ public:
   }
 
 private:
+  friend class server_test_access;
+
   // This method is executed in the dispatcher thread.
   void stop() {
     stopped_ = true;
@@ -454,13 +456,10 @@ private:
               }
             });
 
-        self->enqueue_to_dispatcher([weak_self, id] {
-          if (auto self = weak_self.lock();
-              self &&
-              self->exposed_peer_ids_.erase(id) > 0) {
-            self->peer_closed(id);
-          }
-        });
+        // Remote disconnects and peer I/O errors bypass close_peer(), so they
+        // need this notification path. For local closes, enqueue_peer_closed()
+        // suppresses duplicates from the async_close completion callback.
+        self->enqueue_peer_closed(id);
       }
     });
 
@@ -642,9 +641,26 @@ private:
         it != peers_.end()) {
       request_manager_.complete_peer(id,
                                      asio::error::operation_aborted);
-      it->second->async_close();
+      // When the server initiates a disconnect, removing the peer from peers_
+      // may destroy it before its queued closed signal runs. Therefore, queue
+      // the server-owned notification explicitly in the async_close completion
+      // callback instead of relying on that signal. This also ensures the
+      // socket is closed before peer_closed is delivered.
+      it->second->async_close([weak_self = weak_from_this(), id] {
+        if (auto self = weak_self.lock()) {
+          self->enqueue_peer_closed(id);
+        }
+      });
       peers_.erase(it);
     }
+  }
+
+  void enqueue_peer_closed(peer_id id) {
+    enqueue_to_dispatcher([this, id] {
+      if (exposed_peer_ids_.erase(id) > 0) {
+        peer_closed(id);
+      }
+    });
   }
 
   // This method is executed in the shared I/O runtime thread.

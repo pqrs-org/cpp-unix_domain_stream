@@ -249,20 +249,26 @@ private:
             return;
           }
 
+          asio::error_code error_code;
+          auto endpoint = asio_helper::make_endpoint(self->socket_file_path_, error_code);
+          if (error_code) {
+            self->handle_bind_failed(error_code);
+            return;
+          }
+
           runtime::remove_socket_file_path(self->socket_file_path_);
           auto resolved_socket_file_path = runtime::make_socket_file_path_key(self->socket_file_path_);
 
           self->acceptor_ = std::make_unique<asio::local::stream_protocol::acceptor>(self->io_ctx_);
 
-          asio::error_code error_code;
-          self->acceptor_->open(asio::local::stream_protocol::endpoint(self->socket_file_path_).protocol(),
+          self->acceptor_->open(endpoint.protocol(),
                                 error_code);
           if (error_code) {
             self->handle_bind_failed(error_code);
             return;
           }
 
-          self->acceptor_->bind(asio::local::stream_protocol::endpoint(self->socket_file_path_),
+          self->acceptor_->bind(endpoint,
                                 error_code);
           if (error_code) {
             self->handle_bind_failed(error_code);
@@ -542,6 +548,12 @@ private:
           }
 
           self->socket_path_health_check_in_progress_ = true;
+          asio::error_code endpoint_error_code;
+          auto endpoint = asio_helper::make_endpoint(self->socket_file_path_, endpoint_error_code);
+          if (endpoint_error_code) {
+            self->handle_socket_path_health_check_failed(endpoint_error_code);
+            return;
+          }
 
           not_null_shared_ptr_t<asio::local::stream_protocol::socket> socket(std::make_shared<asio::local::stream_protocol::socket>(self->io_ctx_));
           not_null_shared_ptr_t<asio::steady_timer> timeout(std::make_shared<asio::steady_timer>(self->io_ctx_));
@@ -556,7 +568,7 @@ private:
           });
 
           socket->async_connect(
-              asio::local::stream_protocol::endpoint(self->socket_file_path_),
+              endpoint,
               [self, socket, timeout](auto&& error_code) mutable {
                 if (self->stopped_) {
                   timeout->cancel();

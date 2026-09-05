@@ -482,6 +482,121 @@ int main() {
     dispatcher->terminate();
   };
 
+  "unix_domain_stream::overlong_socket_path_reports_error"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::overlong_socket_path_reports_error)" << std::endl;
+
+    // Endpoint construction must report an error rather than terminate the I/O thread.
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+    auto path = server_socket_file_path.parent_path() / std::string(256, 'x');
+    std::atomic_size_t bind_failures = 0;
+    std::atomic_size_t connect_failures = 0;
+    std::atomic_size_t successes = 0;
+    auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher, path, make_options());
+    auto client = std::make_unique<pqrs::unix_domain_stream::client>(dispatcher, path, make_options());
+    server->bind_failed.connect([&](const auto& error_code) {
+      expect(dispatcher->dispatcher_thread());
+      expect(error_code == asio::error::name_too_long);
+      ++bind_failures;
+    });
+    client->connect_failed.connect([&](const auto& error_code) {
+      expect(dispatcher->dispatcher_thread());
+      expect(error_code == asio::error::name_too_long);
+      ++connect_failures;
+    });
+    server->bound.connect([&] { ++successes; });
+    client->connected.connect([&](const auto&) { ++successes; });
+    server->async_start();
+    client->async_start();
+
+    // Retry must remain functional after an invalid endpoint is rejected.
+    expect(wait_until([&] { return bind_failures.load() >= 2 && connect_failures.load() >= 2; }));
+    expect(successes.load() == 0);
+    client.reset();
+    server.reset();
+    dispatcher->terminate();
+  };
+
+  "unix_domain_stream::client_discards_connected_after_stop_or_invalidate"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::client_discards_connected_after_stop_or_invalidate)" << std::endl;
+
+    // Check stop, stop followed by start, and invalidate followed by reconnect.
+    for (int action : {0, 1, 2}) {
+      auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+      auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+      prepare_socket_file_path(server_socket_file_path);
+      auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher, server_socket_file_path, make_options());
+      std::atomic_bool bound = false;
+      server->bound.connect([&] { bound = true; });
+      server->async_start();
+      expect(wait_until([&] { return bound.load(); }));
+
+      // Queue the stop/invalidate ahead of connected, while allowing the
+      // I/O thread to finish the initial connection behind a dispatcher blocker.
+      pqrs::dispatcher::extra::dispatcher_client blocker(dispatcher);
+      std::promise<void> dispatcher_blocked;
+      std::promise<void> release_dispatcher;
+      auto release_dispatcher_future = release_dispatcher.get_future().share();
+      bool first_verification = true;
+      std::unique_ptr<pqrs::unix_domain_stream::client> client;
+      client = std::make_unique<pqrs::unix_domain_stream::client>(
+          dispatcher, server_socket_file_path, make_options(), [&](const auto&) {
+            if (std::exchange(first_verification, false)) {
+              blocker.enqueue_to_dispatcher([&] {
+                dispatcher_blocked.set_value();
+                release_dispatcher_future.wait();
+              });
+              if (action == 2) {
+                client->async_invalidate_connection();
+              } else {
+                client->async_stop();
+                if (action == 1) {
+                  client->async_start();
+                }
+              }
+            }
+            return true;
+          });
+      std::atomic_size_t connected_count = 0;
+      client->connected.connect([&](const auto&) {
+        expect(dispatcher->dispatcher_thread());
+        ++connected_count;
+      });
+      client->async_start();
+      dispatcher_blocked.get_future().wait();
+      // Drain the finite chain of posts that starts the peer and queues connected.
+      for (int i = 0; i < 4; ++i) {
+        std::promise<void> barrier;
+        asio::post(pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(), [&] { barrier.set_value(); });
+        barrier.get_future().wait();
+      }
+
+      // Prevent a new connection from starting while the dispatcher processes
+      // the stale notification, so it cannot be confused with a valid reconnect.
+      std::promise<void> io_blocked;
+      std::promise<void> release_io;
+      auto release_io_future = release_io.get_future().share();
+      asio::post(pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(), [&] {
+        io_blocked.set_value();
+        release_io_future.wait();
+      });
+      io_blocked.get_future().wait();
+      release_dispatcher.set_value();
+      expect(wait_dispatcher_barrier(dispatcher));
+      expect(connected_count.load() == 0);
+      release_io.set_value();
+
+      // Restart and invalidate must still produce a notification for the new connection.
+      if (action != 0) {
+        expect(wait_until([&] { return connected_count.load() == 1; }));
+      }
+      blocker.detach_from_dispatcher();
+      client.reset();
+      server.reset();
+      dispatcher->terminate();
+    }
+  };
+
   "unix_domain_stream::client_server"_test = [] {
     std::cout << "TEST_CASE(unix_domain_stream::client_server)" << std::endl;
 

@@ -187,6 +187,7 @@ private:
   // This method is executed in the dispatcher thread.
   void stop() {
     stopped_ = true;
+    ++connection_generation_;
     reconnect_task_.cancel();
     auto weak_self = weak_from_this();
 
@@ -203,15 +204,27 @@ private:
   // This method is executed in the dispatcher thread.
   void connect() {
     auto weak_self = weak_from_this();
+    auto connection_generation = connection_generation_.load();
 
     asio::post(
         io_ctx_,
-        [weak_self] {
+        [weak_self, connection_generation] {
           auto self = weak_self.lock();
           if (!self ||
               self->stopped_ ||
+              self->connection_generation_ != connection_generation ||
               self->connecting_socket_ ||
               self->peer_) {
+            return;
+          }
+
+          asio::error_code endpoint_error_code;
+          auto endpoint = asio_helper::make_endpoint(self->socket_file_path_, endpoint_error_code);
+          if (endpoint_error_code) {
+            self->enqueue_to_dispatcher([self, endpoint_error_code] {
+              self->connect_failed(endpoint_error_code);
+              self->schedule_reconnect();
+            });
             return;
           }
 
@@ -219,8 +232,8 @@ private:
           self->connecting_socket_ = socket;
 
           socket->async_connect(
-              asio::local::stream_protocol::endpoint(self->socket_file_path_),
-              [self, socket](auto&& error_code) mutable {
+              endpoint,
+              [self, socket, connection_generation](auto&& error_code) mutable {
                 // A newer connect attempt or invalidate_connection has replaced this socket.
                 if (self->stopped_ ||
                     self->connecting_socket_ != socket.get()) {
@@ -241,15 +254,16 @@ private:
 
                 auto credentials = impl::make_peer_credentials(*socket);
 
-                if (!self->enqueue_to_dispatcher([self, socket, credentials] {
+                if (!self->enqueue_to_dispatcher([self, socket, credentials, connection_generation] {
                       auto verified = self->verify_peer_(credentials);
 
                       asio::post(
                           self->io_ctx_,
-                          [self, socket, credentials, verified] {
+                          [self, socket, credentials, verified, connection_generation] {
                             self->handle_connected_socket(socket,
                                                           credentials,
-                                                          verified);
+                                                          verified,
+                                                          connection_generation);
                           });
                     })) {
                   self->connecting_socket_.reset();
@@ -263,6 +277,7 @@ private:
 
   // This method is executed in the dispatcher thread.
   void invalidate_connection() {
+    ++connection_generation_;
     reconnect_task_.cancel();
     auto weak_self = weak_from_this();
 
@@ -294,7 +309,8 @@ private:
   // This method is executed in the shared I/O runtime thread.
   void handle_connected_socket(not_null_shared_ptr_t<asio::local::stream_protocol::socket> socket,
                                const peer_credentials& credentials,
-                               bool verified) {
+                               bool verified,
+                               uint64_t connection_generation) {
     // A newer connect attempt or invalidate_connection has replaced this socket.
     if (connecting_socket_ != socket.get()) {
       asio::error_code close_error_code;
@@ -304,7 +320,7 @@ private:
 
     connecting_socket_.reset();
 
-    if (stopped_) {
+    if (stopped_ || connection_generation_ != connection_generation) {
       asio::error_code close_error_code;
       socket->close(close_error_code);
       return;
@@ -460,14 +476,19 @@ private:
 
     asio::post(
         io_ctx_,
-        [weak_self, weak_p, credentials] {
+        [weak_self, weak_p, credentials, connection_generation] {
           auto self = weak_self.lock();
           auto p = weak_p.lock();
           if (self &&
               p &&
               self->peer_ == p) {
-            self->enqueue_to_dispatcher([weak_self, credentials] {
-              if (auto self = weak_self.lock()) {
+            self->enqueue_to_dispatcher([weak_self, credentials, connection_generation] {
+              // Stop/invalidate can run after the I/O-side check but before
+              // this notification. Reject it even if the client restarted.
+              if (auto self = weak_self.lock();
+                  self &&
+                  !self->stopped_ &&
+                  self->connection_generation_ == connection_generation) {
                 self->connected(credentials);
               }
             });
@@ -540,6 +561,7 @@ private:
   std::function<bool(const peer_credentials&)> verify_peer_;
   dispatcher::extra::debounced_task reconnect_task_;
   std::atomic_bool stopped_ = true;
+  std::atomic_uint64_t connection_generation_ = 0;
 
   asio::io_context& io_ctx_;
   request_manager request_manager_;

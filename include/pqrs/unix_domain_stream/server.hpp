@@ -7,6 +7,7 @@
 // `pqrs::unix_domain_stream::server` can be used safely in a multi-threaded environment.
 
 #include "impl/credentials.hpp"
+#include "impl/notification_scope.hpp"
 #include "impl/peer.hpp"
 #include "impl/request_manager.hpp"
 #include "impl/runtime.hpp"
@@ -37,11 +38,20 @@ public:
   nod::signal<void()> bound;
   nod::signal<void(const asio::error_code&)> bind_failed;
   nod::signal<void()> closed;
-  nod::signal<void(peer_id, const peer_credentials&)> peer_connected;
+  nod::signal<void(peer_id,
+                   const peer_credentials&)>
+      peer_connected;
   nod::signal<void(peer_id)> peer_closed;
-  nod::signal<void(peer_id, const asio::error_code&)> peer_error_occurred;
-  nod::signal<void(peer_id, not_null_shared_ptr_t<std::vector<uint8_t>>)> received;
-  nod::signal<void(peer_id, request_id, not_null_shared_ptr_t<std::vector<uint8_t>>)> request_received;
+  nod::signal<void(peer_id,
+                   const asio::error_code&)>
+      peer_error_occurred;
+  nod::signal<void(peer_id,
+                   not_null_shared_ptr_t<std::vector<uint8_t>>)>
+      received;
+  nod::signal<void(peer_id,
+                   request_id,
+                   not_null_shared_ptr_t<std::vector<uint8_t>>)>
+      request_received;
 
   server_state(const server_state&) = delete;
 
@@ -53,6 +63,7 @@ public:
         socket_file_path_(socket_file_path),
         options_(options),
         verify_peer_(verify_peer),
+        notification_scope_(*this),
         bind_retry_task_(*this),
         socket_path_health_check_timer_(*this),
         io_ctx_(runtime::get_io_context()),
@@ -72,7 +83,7 @@ public:
     auto shared_self = shared_from_this();
 
     detach_from_dispatcher([this] {
-      stopped_ = true;
+      notification_scope_.stop();
       bind_retry_task_.cancel();
       socket_path_health_check_timer_.stop();
       exposed_peer_ids_.clear();
@@ -113,7 +124,7 @@ public:
 
   void async_start() {
     enqueue_to_dispatcher([this] {
-      stopped_ = false;
+      notification_scope_.start();
       bind();
     });
   }
@@ -216,8 +227,7 @@ private:
 
   // This method is executed in the dispatcher thread.
   void stop() {
-    stopped_ = true;
-    ++stop_generation_;
+    notification_scope_.stop();
     bind_retry_task_.cancel();
     socket_path_health_check_timer_.stop();
     exposed_peer_ids_.clear();
@@ -238,21 +248,24 @@ private:
   // This method is executed in the dispatcher thread.
   void bind() {
     auto weak_self = weak_from_this();
+    auto notification_token = notification_scope_.capture();
 
     asio::post(
         io_ctx_,
-        [weak_self] {
+        [weak_self, notification_token] {
           auto self = weak_self.lock();
           if (!self ||
-              self->stopped_ ||
+              !self->notification_scope_.is_current(notification_token) ||
               self->acceptor_) {
             return;
           }
 
           asio::error_code error_code;
-          auto endpoint = asio_helper::make_endpoint(self->socket_file_path_, error_code);
+          auto endpoint = asio_helper::make_endpoint(self->socket_file_path_,
+                                                     error_code);
           if (error_code) {
-            self->handle_bind_failed(error_code);
+            self->handle_bind_failed(error_code,
+                                     notification_token);
             return;
           }
 
@@ -264,14 +277,16 @@ private:
           self->acceptor_->open(endpoint.protocol(),
                                 error_code);
           if (error_code) {
-            self->handle_bind_failed(error_code);
+            self->handle_bind_failed(error_code,
+                                     notification_token);
             return;
           }
 
           self->acceptor_->bind(endpoint,
                                 error_code);
           if (error_code) {
-            self->handle_bind_failed(error_code);
+            self->handle_bind_failed(error_code,
+                                     notification_token);
             return;
           }
 
@@ -282,41 +297,46 @@ private:
           self->acceptor_->listen(asio::socket_base::max_listen_connections,
                                   error_code);
           if (error_code) {
-            self->handle_bind_failed(error_code);
+            self->handle_bind_failed(error_code,
+                                     notification_token);
             return;
           }
 
-          self->enqueue_to_dispatcher([weak_self] {
-            if (auto self = weak_self.lock()) {
-              self->bound();
-              self->start_socket_path_health_check_timer();
-            }
-          });
+          self->notification_scope_.enqueue(
+              notification_token,
+              [self] {
+                self->bound();
+                self->start_socket_path_health_check_timer();
+              });
 
-          self->accept();
+          self->accept(notification_token);
         });
   }
 
   // This method is executed in the shared I/O runtime thread.
-  void handle_bind_failed(const asio::error_code& error_code) {
+  void handle_bind_failed(const asio::error_code& error_code,
+                          notification_scope::token notification_token) {
     close_acceptor();
 
-    enqueue_to_dispatcher([this, error_code] {
-      bind_failed(error_code);
-      schedule_bind_retry();
-    });
+    notification_scope_.enqueue(
+        notification_token,
+        [this, error_code] {
+          bind_failed(error_code);
+          schedule_bind_retry();
+        });
   }
 
   // This method is executed in the shared I/O runtime thread.
-  void accept() {
-    if (stopped_ ||
+  void accept(notification_scope::token notification_token) {
+    if (!notification_scope_.is_current(notification_token) ||
         !acceptor_) {
       return;
     }
 
     acceptor_->async_accept(
-        [self = shared_from_this()](auto&& error_code, auto socket) {
-          if (self->stopped_) {
+        [self = shared_from_this(), notification_token](auto&& error_code,
+                                                        auto socket) {
+          if (!self->notification_scope_.is_current(notification_token)) {
             asio::error_code close_error_code;
             socket.close(close_error_code);
             return;
@@ -326,22 +346,25 @@ private:
             if (error_code != asio::error::operation_aborted) {
               self->close_acceptor();
 
-              self->enqueue_to_dispatcher([self] {
-                self->closed();
-                self->schedule_bind_retry();
-              });
+              self->notification_scope_.enqueue(
+                  notification_token,
+                  [self] {
+                    self->closed();
+                    self->schedule_bind_retry();
+                  });
             }
             return;
           }
 
-          self->handle_accepted_socket(std::move(socket));
+          self->handle_accepted_socket(std::move(socket),
+                                       notification_token);
         });
   }
 
   // This method is executed in the shared I/O runtime thread.
-  void handle_accepted_socket(asio::local::stream_protocol::socket socket) {
-    auto stop_generation = stop_generation_.load();
-    if (stopped_) {
+  void handle_accepted_socket(asio::local::stream_protocol::socket socket,
+                              notification_scope::token notification_token) {
+    if (!notification_scope_.is_current(notification_token)) {
       asio::error_code close_error_code;
       socket.close(close_error_code);
       return;
@@ -357,30 +380,25 @@ private:
     auto weak_self = weak_from_this();
     auto weak_p = make_weak(p);
 
-    p->ready.connect([weak_self, id, credentials, stop_generation] {
+    p->ready.connect([weak_self, id, credentials, notification_token] {
       if (auto self = weak_self.lock()) {
-        self->enqueue_to_dispatcher([weak_self, id, credentials, stop_generation] {
-          // A queued ready notification must not expose a peer from before
-          // stop(), even if the server has already been started again.
-          if (auto self = weak_self.lock();
-              self &&
-              !self->stopped_ &&
-              self->stop_generation_ == stop_generation) {
-            if (self->verify_peer_(credentials)) {
-              self->exposed_peer_ids_.insert(id);
-              self->peer_connected(id,
-                                   credentials);
-            } else {
-              asio::post(
-                  self->io_ctx_,
-                  [weak_self, id] {
-                    if (auto self = weak_self.lock()) {
-                      self->close_peer(id);
-                    }
-                  });
-            }
-          }
-        });
+        self->notification_scope_.enqueue(
+            notification_token,
+            [self, id, credentials] {
+              if (self->verify_peer_(credentials)) {
+                self->exposed_peer_ids_.insert(id);
+                self->peer_connected(id,
+                                     credentials);
+              } else {
+                asio::post(
+                    self->io_ctx_,
+                    [weak_self = self->weak_from_this(), id] {
+                      if (auto self = weak_self.lock()) {
+                        self->close_peer(id);
+                      }
+                    });
+              }
+            });
       }
     });
 
@@ -397,7 +415,8 @@ private:
       }
     });
 
-    p->request_received.connect([weak_self, id](auto request_id, auto&& buffer) {
+    p->request_received.connect([weak_self, id](auto request_id,
+                                                auto&& buffer) {
       if (auto self = weak_self.lock()) {
         self->enqueue_to_dispatcher([weak_self, id, request_id, buffer] {
           if (auto self = weak_self.lock();
@@ -411,7 +430,8 @@ private:
       }
     });
 
-    p->response_received.connect([weak_self, id, weak_p](auto request_id, auto&& buffer) {
+    p->response_received.connect([weak_self, id, weak_p](auto request_id,
+                                                         auto&& buffer) {
       if (auto self = weak_self.lock();
           self) {
         auto weak_self = self->weak_from_this();
@@ -481,7 +501,7 @@ private:
 
     p->async_start();
 
-    accept();
+    accept(notification_token);
   }
 
   // This method is executed in the shared I/O runtime thread.
@@ -504,13 +524,13 @@ private:
   void schedule_bind_retry() {
     socket_path_health_check_timer_.stop();
 
-    if (stopped_) {
+    if (!notification_scope_.running()) {
       return;
     }
 
     bind_retry_task_.debounce_after(
         [this] {
-          if (stopped_) {
+          if (!notification_scope_.running()) {
             return;
           }
 
@@ -521,7 +541,7 @@ private:
 
   // This method is executed in the dispatcher thread.
   void start_socket_path_health_check_timer() {
-    if (stopped_) {
+    if (!notification_scope_.running()) {
       return;
     }
 
@@ -535,13 +555,14 @@ private:
   // This method is executed in the dispatcher thread.
   void socket_path_health_check() {
     auto weak_self = weak_from_this();
+    auto notification_token = notification_scope_.capture();
 
     asio::post(
         io_ctx_,
-        [weak_self] {
+        [weak_self, notification_token] {
           auto self = weak_self.lock();
           if (!self ||
-              self->stopped_ ||
+              !self->notification_scope_.is_current(notification_token) ||
               !self->acceptor_ ||
               self->socket_path_health_check_in_progress_) {
             return;
@@ -549,9 +570,11 @@ private:
 
           self->socket_path_health_check_in_progress_ = true;
           asio::error_code endpoint_error_code;
-          auto endpoint = asio_helper::make_endpoint(self->socket_file_path_, endpoint_error_code);
+          auto endpoint = asio_helper::make_endpoint(self->socket_file_path_,
+                                                     endpoint_error_code);
           if (endpoint_error_code) {
-            self->handle_socket_path_health_check_failed(endpoint_error_code);
+            self->handle_socket_path_health_check_failed(endpoint_error_code,
+                                                         notification_token);
             return;
           }
 
@@ -559,29 +582,30 @@ private:
           not_null_shared_ptr_t<asio::steady_timer> timeout(std::make_shared<asio::steady_timer>(self->io_ctx_));
 
           timeout->expires_after(self->options_.socket_path_health_check_timeout);
-          timeout->async_wait([self, socket](const auto& error_code) {
+          timeout->async_wait([self, socket, notification_token](const auto& error_code) {
             if (!error_code) {
               asio::error_code close_error_code;
               socket->close(close_error_code);
-              self->handle_socket_path_health_check_failed(asio::error::timed_out);
+              self->handle_socket_path_health_check_failed(asio::error::timed_out,
+                                                           notification_token);
             }
           });
 
           socket->async_connect(
               endpoint,
-              [self, socket, timeout](auto&& error_code) mutable {
-                if (self->stopped_) {
+              [self, socket, timeout, notification_token](auto&& error_code) mutable {
+                if (!self->notification_scope_.is_current(notification_token)) {
                   timeout->cancel();
 
                   asio::error_code close_error_code;
                   socket->close(close_error_code);
-                  self->socket_path_health_check_in_progress_ = false;
                   return;
                 }
 
                 if (error_code) {
                   timeout->cancel();
-                  self->handle_socket_path_health_check_failed(error_code);
+                  self->handle_socket_path_health_check_failed(error_code,
+                                                               notification_token);
                   return;
                 }
 
@@ -591,12 +615,14 @@ private:
                 self->socket_path_health_check_peer_ = p;
                 auto weak_self = self->weak_from_this();
 
-                p->health_check_response_received.connect([weak_self, timeout] {
-                  if (auto self = weak_self.lock()) {
+                p->health_check_response_received.connect([weak_self, timeout, notification_token] {
+                  if (auto self = weak_self.lock();
+                      self && self->notification_scope_.is_current(notification_token)) {
                     asio::post(
                         self->io_ctx_,
-                        [weak_self, timeout] {
-                          if (auto self = weak_self.lock()) {
+                        [weak_self, timeout, notification_token] {
+                          if (auto self = weak_self.lock();
+                              self && self->notification_scope_.is_current(notification_token)) {
                             timeout->cancel();
 
                             self->close_socket_path_health_check_peer();
@@ -607,29 +633,35 @@ private:
                   }
                 });
 
-                p->error_occurred.connect([weak_self, timeout](auto&& error_code) {
-                  if (auto self = weak_self.lock()) {
+                p->error_occurred.connect([weak_self, timeout, notification_token](auto&& error_code) {
+                  if (auto self = weak_self.lock();
+                      self && self->notification_scope_.is_current(notification_token)) {
                     asio::post(
                         self->io_ctx_,
-                        [weak_self, timeout, error_code] {
-                          if (auto self = weak_self.lock()) {
+                        [weak_self, timeout, error_code, notification_token] {
+                          if (auto self = weak_self.lock();
+                              self && self->notification_scope_.is_current(notification_token)) {
                             timeout->cancel();
-                            self->handle_socket_path_health_check_failed(error_code);
+                            self->handle_socket_path_health_check_failed(error_code,
+                                                                         notification_token);
                           }
                         });
                   }
                 });
 
-                p->closed.connect([weak_self, timeout] {
-                  if (auto self = weak_self.lock()) {
+                p->closed.connect([weak_self, timeout, notification_token] {
+                  if (auto self = weak_self.lock();
+                      self && self->notification_scope_.is_current(notification_token)) {
                     asio::post(
                         self->io_ctx_,
-                        [weak_self, timeout] {
-                          if (auto self = weak_self.lock()) {
+                        [weak_self, timeout, notification_token] {
+                          if (auto self = weak_self.lock();
+                              self && self->notification_scope_.is_current(notification_token)) {
                             timeout->cancel();
 
                             if (self->socket_path_health_check_in_progress_) {
-                              self->handle_socket_path_health_check_failed(asio::error::eof);
+                              self->handle_socket_path_health_check_failed(asio::error::eof,
+                                                                           notification_token);
                             }
                           }
                         });
@@ -643,8 +675,10 @@ private:
   }
 
   // This method is executed in the shared I/O runtime thread.
-  void handle_socket_path_health_check_failed(const asio::error_code&) {
-    if (!socket_path_health_check_in_progress_) {
+  void handle_socket_path_health_check_failed(const asio::error_code&,
+                                              notification_scope::token notification_token) {
+    if (!notification_scope_.is_current(notification_token) ||
+        !socket_path_health_check_in_progress_) {
       return;
     }
 
@@ -654,10 +688,12 @@ private:
 
     close_acceptor();
 
-    enqueue_to_dispatcher([this] {
-      closed();
-      schedule_bind_retry();
-    });
+    notification_scope_.enqueue(
+        notification_token,
+        [this] {
+          closed();
+          schedule_bind_retry();
+        });
   }
 
   // This method is executed in the shared I/O runtime thread.
@@ -729,12 +765,9 @@ private:
   std::filesystem::path socket_file_path_;
   server_options options_;
   std::function<bool(const peer_credentials&)> verify_peer_;
+  notification_scope notification_scope_;
   dispatcher::extra::debounced_task bind_retry_task_;
   dispatcher::extra::timer socket_path_health_check_timer_;
-  std::atomic_bool stopped_ = true;
-  // Invalidate all old peers together; debouncing would drop independent
-  // ready notifications from concurrently connecting peers.
-  std::atomic_uint64_t stop_generation_ = 0;
 
   asio::io_context& io_ctx_;
   request_manager request_manager_;
@@ -766,11 +799,16 @@ public:
   nod::signal<void()>& bound;
   nod::signal<void(const asio::error_code&)>& bind_failed;
   nod::signal<void()>& closed;
-  nod::signal<void(peer_id, const peer_credentials&)>& peer_connected;
+  nod::signal<void(peer_id,
+                   const peer_credentials&)>& peer_connected;
   nod::signal<void(peer_id)>& peer_closed;
-  nod::signal<void(peer_id, const asio::error_code&)>& peer_error_occurred;
-  nod::signal<void(peer_id, not_null_shared_ptr_t<std::vector<uint8_t>>)>& received;
-  nod::signal<void(peer_id, request_id, not_null_shared_ptr_t<std::vector<uint8_t>>)>& request_received;
+  nod::signal<void(peer_id,
+                   const asio::error_code&)>& peer_error_occurred;
+  nod::signal<void(peer_id,
+                   not_null_shared_ptr_t<std::vector<uint8_t>>)>& received;
+  nod::signal<void(peer_id,
+                   request_id,
+                   not_null_shared_ptr_t<std::vector<uint8_t>>)>& request_received;
 
   server(const server&) = delete;
 

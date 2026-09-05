@@ -8,6 +8,7 @@
 #include <pqrs/unix_domain_stream.hpp>
 #include <pqrs/unix_domain_stream/impl/protocol.hpp>
 #include <thread>
+#include <type_traits>
 #include <unistd.h>
 #include <utility>
 
@@ -22,6 +23,14 @@ public:
   // Call on the I/O runtime thread.
   [[nodiscard]] static size_t socket_file_path_owner_count() {
     return runtime::get_instance().socket_file_path_owners_.size();
+  }
+};
+
+class client_test_access final {
+public:
+  // Call on the I/O runtime thread.
+  static std::shared_ptr<peer> get_peer(client_state& client) {
+    return client.peer_;
   }
 };
 
@@ -43,6 +52,35 @@ public:
   // Call on the I/O runtime thread.
   static void close_peer(server_state& server, peer_id id) {
     server.close_peer(id);
+  }
+
+  // Call on the dispatcher thread, just like the periodic health-check timer.
+  static void start_socket_path_health_check(server_state& server) {
+    server.socket_path_health_check();
+  }
+
+  // Call on the I/O runtime thread.
+  [[nodiscard]] static std::shared_ptr<peer> get_socket_path_health_check_peer(server_state& server) {
+    return server.socket_path_health_check_peer_;
+  }
+
+  // Call on the I/O runtime thread.
+  [[nodiscard]] static bool socket_path_health_check_in_progress(server_state& server) {
+    return server.socket_path_health_check_in_progress_;
+  }
+
+  // Call on the I/O runtime thread.
+  [[nodiscard]] static bool acceptor_is_open(server_state& server) {
+    return server.acceptor_ && server.acceptor_->is_open();
+  }
+
+  // Capture the same session as the timeout handler, then invoke on the I/O
+  // thread after restart without depending on wall-clock timer ordering.
+  static std::function<void()> make_socket_path_health_check_timeout(server_state& server) {
+    auto token = server.notification_scope_.capture();
+    return [&server, token] {
+      server.handle_socket_path_health_check_failed(asio::error::timed_out, token);
+    };
   }
 
   // Call on the dispatcher thread.
@@ -155,6 +193,15 @@ bool wait_dispatcher_barrier(pqrs::not_null_shared_ptr_t<pqrs::dispatcher::dispa
   barrier.detach_from_dispatcher();
 
   return result;
+}
+
+template <typename Function>
+auto invoke_on_io_context(Function function) {
+  using result_type = std::invoke_result_t<Function>;
+  auto task = std::make_shared<std::packaged_task<result_type()>>(std::move(function));
+  auto result = task->get_future();
+  asio::post(pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(), [task] { (*task)(); });
+  return result.get();
 }
 
 class test_server final {
@@ -480,6 +527,187 @@ int main() {
     client.reset();
     new_server.reset();
     dispatcher->terminate();
+  };
+
+  "unix_domain_stream::notification_scope_cancels_sessions_not_results"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::notification_scope_cancels_sessions_not_results)" << std::endl;
+
+    auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+    pqrs::dispatcher::extra::dispatcher_client owner(dispatcher);
+    pqrs::unix_domain_stream::impl::notification_scope notifications(owner);
+    std::atomic_size_t stale = 0;
+    std::atomic_size_t current = 0;
+    std::atomic_size_t completed = 0;
+    std::promise<void> queued;
+    owner.enqueue_to_dispatcher([&] {
+      notifications.start();
+      auto old = notifications.capture();
+      notifications.enqueue(old, [&] { ++stale; });
+      // Request results bypass the session scope and must not be cancelled.
+      owner.enqueue_to_dispatcher([&] { ++completed; });
+      notifications.stop();
+      notifications.start();
+      notifications.enqueue(old, [&] { ++stale; });
+      auto invalidated = notifications.capture();
+      notifications.enqueue(invalidated, [&] { ++stale; });
+      notifications.invalidate();
+      notifications.enqueue(invalidated, [&] { ++stale; });
+      auto active = notifications.capture();
+      notifications.enqueue(active, [&] { ++current; });
+      notifications.enqueue(active, [&] { ++current; });
+      queued.set_value();
+    });
+    queued.get_future().wait();
+    expect(wait_dispatcher_barrier(dispatcher));
+    expect(stale.load() == 0);
+    expect(current.load() == 2);
+    expect(completed.load() == 1);
+    owner.detach_from_dispatcher();
+    dispatcher->terminate();
+  };
+
+  "unix_domain_stream::server_discards_bound_and_bind_failed_after_stop"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::server_discards_bound_and_bind_failed_after_stop)" << std::endl;
+
+    for (bool fail_bind : {false, true}) {
+      for (bool restart : {false, true}) {
+        auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+        auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+        prepare_socket_file_path(server_socket_file_path);
+        auto path = fail_bind ? std::filesystem::path(std::string(256, 'x')) : server_socket_file_path;
+        auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher, path, make_options());
+        std::atomic_size_t bound = 0;
+        std::atomic_size_t failed = 0;
+        server->bound.connect([&] { ++bound; });
+        server->bind_failed.connect([&](const auto&) { ++failed; });
+
+        // Let start run, but hold the I/O thread until stop is queued ahead
+        // of the old bind result on the blocked dispatcher.
+        std::promise<void> io_blocked, release_io, dispatcher_blocked, release_dispatcher;
+        auto io_release = release_io.get_future().share();
+        auto dispatcher_release = release_dispatcher.get_future().share();
+        asio::post(pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(), [&] {
+          io_blocked.set_value();
+          io_release.wait();
+        });
+        io_blocked.get_future().wait();
+        pqrs::dispatcher::extra::dispatcher_client blocker(dispatcher);
+        server->async_start();
+        blocker.enqueue_to_dispatcher([&] {
+          dispatcher_blocked.set_value();
+          dispatcher_release.wait();
+        });
+        server->async_stop();
+        if (restart) {
+          server->async_start();
+        }
+        dispatcher_blocked.get_future().wait();
+        release_io.set_value();
+        std::promise<void> old_result_queued;
+        asio::post(pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(), [&] { old_result_queued.set_value(); });
+        old_result_queued.get_future().wait();
+
+        // Keep a restarted bind pending until the stale notification is checked.
+        std::promise<void> io_blocked_again, release_io_again;
+        auto io_release_again = release_io_again.get_future().share();
+        asio::post(pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(), [&] {
+          io_blocked_again.set_value();
+          io_release_again.wait();
+        });
+        io_blocked_again.get_future().wait();
+        release_dispatcher.set_value();
+        expect(wait_dispatcher_barrier(dispatcher));
+        expect(bound.load() == 0);
+        expect(failed.load() == 0);
+        release_io_again.set_value();
+        if (restart) {
+          expect(wait_until([&] { return fail_bind ? failed.load() > 0 : bound.load() == 1; }));
+        }
+        blocker.detach_from_dispatcher();
+        server.reset();
+        dispatcher->terminate();
+      }
+    }
+  };
+
+  "unix_domain_stream::client_discards_stale_data_but_completes_requests"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::client_discards_stale_data_but_completes_requests)" << std::endl;
+
+    for (bool invalidate : {false, true}) {
+      auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+      auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+      prepare_socket_file_path(server_socket_file_path);
+      auto server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher, server_socket_file_path, make_options());
+      std::atomic_bool bound = false;
+      server->bound.connect([&] { bound = true; });
+      server->async_start();
+      expect(wait_until([&] { return bound.load(); }));
+      auto client = std::make_shared<pqrs::unix_domain_stream::impl::client_state>(
+          dispatcher, server_socket_file_path, make_options().client,
+          pqrs::unix_domain_stream::default_client_verify_peer);
+      std::atomic_size_t connected = 0;
+      client->connected.connect([&](const auto&) { ++connected; });
+      client->async_start();
+      expect(wait_until([&] { return connected.load() == 1; }));
+      std::atomic_size_t stale = 0;
+      client->received.connect([&](auto) { ++stale; });
+      client->request_received.connect([&](auto, auto) { ++stale; });
+      client->error_occurred.connect([&](const auto&) { ++stale; });
+      client->closed.connect([&] { ++stale; });
+      std::promise<asio::error_code> completed;
+      client->async_request({1}, std::chrono::hours(1), [&](const auto& error_code, auto) { completed.set_value(error_code); });
+
+      // Hold I/O while peer signals queue their forwarding work. These are
+      // real peer slots, invoked directly to control the cross-thread order.
+      std::promise<void> io_blocked, release_io;
+      auto io_release = release_io.get_future().share();
+      std::shared_ptr<pqrs::unix_domain_stream::impl::peer> peer;
+      asio::post(pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(), [&] {
+        peer = pqrs::unix_domain_stream::impl::client_test_access::get_peer(*client);
+        io_blocked.set_value();
+        io_release.wait();
+      });
+      io_blocked.get_future().wait();
+      pqrs::dispatcher::extra::dispatcher_client blocker(dispatcher);
+      std::promise<void> dispatcher_blocked, release_dispatcher;
+      auto dispatcher_release = release_dispatcher.get_future().share();
+      blocker.enqueue_to_dispatcher([&] {
+        pqrs::not_null_shared_ptr_t<std::vector<uint8_t>> buffer(std::make_shared<std::vector<uint8_t>>());
+        peer->received(buffer);
+        peer->request_received(1, buffer);
+        peer->error_occurred(asio::error::connection_reset);
+        if (invalidate) {
+          client->async_invalidate_connection();
+        } else {
+          client->async_stop();
+        }
+        blocker.enqueue_to_dispatcher([&] {
+          dispatcher_blocked.set_value();
+          dispatcher_release.wait();
+        });
+      });
+      dispatcher_blocked.get_future().wait();
+      release_io.set_value();
+      std::promise<void> forwarded;
+      asio::post(pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(), [&] { forwarded.set_value(); });
+      forwarded.get_future().wait();
+      release_dispatcher.set_value();
+      auto result = completed.get_future();
+      expect(result.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+      expect(result.get() == asio::error::connection_reset);
+      expect(wait_dispatcher_barrier(dispatcher));
+      expect(stale.load() == 0);
+      if (invalidate) {
+        expect(wait_until([&] { return connected.load() == 2; }));
+      }
+      blocker.detach_from_dispatcher();
+      peer.reset();
+      client->async_shutdown();
+      client.reset();
+      server.reset();
+      dispatcher->terminate();
+    }
   };
 
   "unix_domain_stream::overlong_socket_path_reports_error"_test = [] {
@@ -2946,6 +3174,155 @@ int main() {
 
     dispatcher->terminate();
     dispatcher = nullptr;
+  };
+
+  "unix_domain_stream::server_ignores_old_health_check_after_restart"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::server_ignores_old_health_check_after_restart)" << std::endl;
+
+    enum class late_event { response,
+                            error,
+                            closed,
+                            timeout };
+    using access = pqrs::unix_domain_stream::impl::server_test_access;
+    using protocol = asio::local::stream_protocol;
+    namespace framing = pqrs::unix_domain_stream::impl::protocol;
+
+    for (auto event : {late_event::response, late_event::error, late_event::closed, late_event::timeout}) {
+      // Keep automatic deadlines out of the way. Each health check is started
+      // explicitly through the same entry point used by the periodic timer.
+      auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+      auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+      prepare_socket_file_path(server_socket_file_path);
+      pqrs::unix_domain_stream::server_options options(
+          {.heartbeat_timeout = std::chrono::hours(1),
+           .read_timeout = std::chrono::hours(1),
+           .write_timeout = std::chrono::hours(1)},
+          {.socket_path_health_check_interval = std::chrono::hours(1),
+           .socket_path_health_check_timeout = std::chrono::hours(1)});
+      auto server = std::make_shared<pqrs::unix_domain_stream::impl::server_state>(
+          dispatcher, server_socket_file_path, options, pqrs::unix_domain_stream::default_verify_peer);
+      std::atomic_size_t bound_count = 0;
+      std::atomic_size_t closed_count = 0;
+      server->bound.connect([&] { ++bound_count; });
+      server->closed.connect([&] { ++closed_count; });
+      server->async_start();
+      expect(wait_until([&] { return bound_count.load() == 1; }));
+
+      // Replace only the filesystem endpoint with a controllable raw listener.
+      // The server keeps its acceptor, while we decide when each probe responds.
+      asio::io_context io_ctx;
+      protocol::acceptor listener(io_ctx);
+      auto replace_listener = [&] {
+        if (listener.is_open()) {
+          listener.close();
+        }
+        std::filesystem::remove(server_socket_file_path);
+        auto endpoint = protocol::endpoint(server_socket_file_path);
+        listener.open(endpoint.protocol());
+        listener.bind(endpoint);
+        listener.listen();
+        listener.non_blocking(true);
+      };
+      auto start_probe = [&](protocol::socket& socket) {
+        server->enqueue_to_dispatcher([&] { access::start_socket_path_health_check(*server); });
+        asio::error_code error_code;
+        bool accepted = wait_until([&] {
+          listener.accept(socket, error_code);
+          return !error_code;
+        });
+        expect(accepted);
+        if (!accepted) {
+          return false;
+        }
+        socket.non_blocking(true);
+        auto expected = framing::make_health_check_frame();
+        std::vector<uint8_t> frame(expected.size());
+        size_t received = 0;
+        expect(wait_until([&] {
+          received += socket.read_some(asio::buffer(frame.data() + received, frame.size() - received), error_code);
+          return received == frame.size();
+        }));
+        expect(frame == expected);
+        return received == frame.size();
+      };
+      auto finish_probe = [&](protocol::socket& socket) {
+        auto response = framing::make_health_check_response_frame();
+        asio::error_code error_code;
+        asio::write(socket, asio::buffer(response), error_code);
+        expect(!error_code);
+        expect(wait_until([&] {
+          return invoke_on_io_context([&] { return !access::socket_path_health_check_in_progress(*server); });
+        }));
+        socket.close();
+      };
+      replace_listener();
+      protocol::socket old_socket(io_ctx);
+      auto old_started = start_probe(old_socket);
+      auto old_peer = invoke_on_io_context([&] { return access::get_socket_path_health_check_peer(*server); });
+      auto old_timeout = invoke_on_io_context([&] { return access::make_socket_path_health_check_timeout(*server); });
+      expect(old_started && old_peer != nullptr);
+
+      // Retain the old peer's signal slots while stop closes its socket. Start
+      // a new probe after restart, before delivering the old completion.
+      server->async_stop();
+      server->async_start();
+      expect(wait_until([&] { return bound_count.load() == 2; }));
+      replace_listener();
+      protocol::socket new_socket(io_ctx);
+      auto new_started = start_probe(new_socket);
+      auto new_peer = invoke_on_io_context([&] { return access::get_socket_path_health_check_peer(*server); });
+      expect(new_started && new_peer != nullptr && new_peer != old_peer);
+      if (old_peer && new_peer) {
+        if (event == late_event::timeout) {
+          invoke_on_io_context(old_timeout);
+        } else {
+          server->enqueue_to_dispatcher([old_peer, event] {
+            switch (event) {
+              case late_event::response:
+                old_peer->health_check_response_received();
+                break;
+              case late_event::error:
+                old_peer->error_occurred(asio::error::connection_reset);
+                break;
+              case late_event::closed:
+                old_peer->closed();
+                break;
+              case late_event::timeout:
+                break;
+            }
+          });
+          expect(wait_dispatcher_barrier(dispatcher));
+        }
+        bool new_probe_unchanged = invoke_on_io_context([&] {
+          return access::get_socket_path_health_check_peer(*server) == new_peer &&
+                 access::socket_path_health_check_in_progress(*server) &&
+                 access::acceptor_is_open(*server);
+        });
+        expect(new_probe_unchanged);
+        expect(wait_dispatcher_barrier(dispatcher));
+        expect(closed_count.load() == 0);
+        expect(bound_count.load() == 2);
+
+        // The new response must still finish its probe, and a subsequent probe
+        // must also work. This catches a stale in-progress flag or lost acceptor.
+        if (new_probe_unchanged && new_started) {
+          finish_probe(new_socket);
+          protocol::socket next_socket(io_ctx);
+          if (start_probe(next_socket)) {
+            finish_probe(next_socket);
+          }
+        }
+      }
+      old_peer.reset();
+      new_peer.reset();
+      old_socket.close();
+      new_socket.close();
+      listener.close();
+      server->async_shutdown();
+      server.reset();
+      invoke_on_io_context([] {});
+      dispatcher->terminate();
+    }
   };
 
   "unix_domain_stream::server_socket_path_health_check"_test = [] {

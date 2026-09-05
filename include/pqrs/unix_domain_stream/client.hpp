@@ -7,6 +7,7 @@
 // `pqrs::unix_domain_stream::client` can be used safely in a multi-threaded environment.
 
 #include "impl/credentials.hpp"
+#include "impl/notification_scope.hpp"
 #include "impl/peer.hpp"
 #include "impl/request_manager.hpp"
 #include "impl/runtime.hpp"
@@ -39,7 +40,9 @@ public:
   nod::signal<void()> closed;
   nod::signal<void(const asio::error_code&)> error_occurred;
   nod::signal<void(not_null_shared_ptr_t<std::vector<uint8_t>>)> received;
-  nod::signal<void(request_id, not_null_shared_ptr_t<std::vector<uint8_t>>)> request_received;
+  nod::signal<void(request_id,
+                   not_null_shared_ptr_t<std::vector<uint8_t>>)>
+      request_received;
 
   client_state(const client_state&) = delete;
 
@@ -51,6 +54,7 @@ public:
         socket_file_path_(socket_file_path),
         options_(options),
         verify_peer_(verify_peer),
+        notification_scope_(*this),
         reconnect_task_(*this),
         io_ctx_(runtime::get_io_context()),
         request_manager_(io_ctx_,
@@ -69,7 +73,7 @@ public:
     auto shared_self = shared_from_this();
 
     detach_from_dispatcher([this] {
-      stopped_ = true;
+      notification_scope_.stop();
       reconnect_task_.cancel();
 
       connected.disconnect_all_slots();
@@ -102,7 +106,7 @@ public:
 
   void async_start() {
     enqueue_to_dispatcher([this] {
-      stopped_ = false;
+      notification_scope_.start();
       connect();
     });
   }
@@ -184,10 +188,11 @@ public:
   }
 
 private:
+  friend class client_test_access;
+
   // This method is executed in the dispatcher thread.
   void stop() {
-    stopped_ = true;
-    ++connection_generation_;
+    notification_scope_.stop();
     reconnect_task_.cancel();
     auto weak_self = weak_from_this();
 
@@ -204,27 +209,29 @@ private:
   // This method is executed in the dispatcher thread.
   void connect() {
     auto weak_self = weak_from_this();
-    auto connection_generation = connection_generation_.load();
+    auto notification_token = notification_scope_.capture();
 
     asio::post(
         io_ctx_,
-        [weak_self, connection_generation] {
+        [weak_self, notification_token] {
           auto self = weak_self.lock();
           if (!self ||
-              self->stopped_ ||
-              self->connection_generation_ != connection_generation ||
+              !self->notification_scope_.is_current(notification_token) ||
               self->connecting_socket_ ||
               self->peer_) {
             return;
           }
 
           asio::error_code endpoint_error_code;
-          auto endpoint = asio_helper::make_endpoint(self->socket_file_path_, endpoint_error_code);
+          auto endpoint = asio_helper::make_endpoint(self->socket_file_path_,
+                                                     endpoint_error_code);
           if (endpoint_error_code) {
-            self->enqueue_to_dispatcher([self, endpoint_error_code] {
-              self->connect_failed(endpoint_error_code);
-              self->schedule_reconnect();
-            });
+            self->notification_scope_.enqueue(
+                notification_token,
+                [self, endpoint_error_code] {
+                  self->connect_failed(endpoint_error_code);
+                  self->schedule_reconnect();
+                });
             return;
           }
 
@@ -233,9 +240,9 @@ private:
 
           socket->async_connect(
               endpoint,
-              [self, socket, connection_generation](auto&& error_code) mutable {
+              [self, socket, notification_token](auto&& error_code) mutable {
                 // A newer connect attempt or invalidate_connection has replaced this socket.
-                if (self->stopped_ ||
+                if (!self->notification_scope_.running() ||
                     self->connecting_socket_ != socket.get()) {
                   asio::error_code close_error_code;
                   socket->close(close_error_code);
@@ -245,27 +252,31 @@ private:
                 if (error_code) {
                   self->connecting_socket_.reset();
 
-                  self->enqueue_to_dispatcher([self, error_code] {
-                    self->connect_failed(error_code);
-                    self->schedule_reconnect();
-                  });
+                  self->notification_scope_.enqueue(
+                      notification_token,
+                      [self, error_code] {
+                        self->connect_failed(error_code);
+                        self->schedule_reconnect();
+                      });
                   return;
                 }
 
                 auto credentials = impl::make_peer_credentials(*socket);
 
-                if (!self->enqueue_to_dispatcher([self, socket, credentials, connection_generation] {
-                      auto verified = self->verify_peer_(credentials);
+                if (!self->notification_scope_.enqueue(
+                        notification_token,
+                        [self, socket, credentials, notification_token] {
+                          auto verified = self->verify_peer_(credentials);
 
-                      asio::post(
-                          self->io_ctx_,
-                          [self, socket, credentials, verified, connection_generation] {
-                            self->handle_connected_socket(socket,
-                                                          credentials,
-                                                          verified,
-                                                          connection_generation);
-                          });
-                    })) {
+                          asio::post(
+                              self->io_ctx_,
+                              [self, socket, credentials, verified, notification_token] {
+                                self->handle_connected_socket(socket,
+                                                              credentials,
+                                                              verified,
+                                                              notification_token);
+                              });
+                        })) {
                   self->connecting_socket_.reset();
 
                   asio::error_code close_error_code;
@@ -277,22 +288,23 @@ private:
 
   // This method is executed in the dispatcher thread.
   void invalidate_connection() {
-    ++connection_generation_;
+    notification_scope_.invalidate();
     reconnect_task_.cancel();
     auto weak_self = weak_from_this();
+    auto notification_token = notification_scope_.capture();
 
     asio::post(
         io_ctx_,
-        [weak_self] {
+        [weak_self, notification_token] {
           if (auto self = weak_self.lock()) {
             self->close_connecting_socket();
             self->close_peer(asio::error::operation_aborted);
 
-            self->enqueue_to_dispatcher([weak_self] {
-              if (auto self = weak_self.lock()) {
-                self->schedule_reconnect();
-              }
-            });
+            self->notification_scope_.enqueue(
+                notification_token,
+                [self] {
+                  self->schedule_reconnect();
+                });
           }
         });
   }
@@ -310,7 +322,7 @@ private:
   void handle_connected_socket(not_null_shared_ptr_t<asio::local::stream_protocol::socket> socket,
                                const peer_credentials& credentials,
                                bool verified,
-                               uint64_t connection_generation) {
+                               notification_scope::token notification_token) {
     // A newer connect attempt or invalidate_connection has replaced this socket.
     if (connecting_socket_ != socket.get()) {
       asio::error_code close_error_code;
@@ -320,7 +332,7 @@ private:
 
     connecting_socket_.reset();
 
-    if (stopped_ || connection_generation_ != connection_generation) {
+    if (!notification_scope_.is_current(notification_token)) {
       asio::error_code close_error_code;
       socket->close(close_error_code);
       return;
@@ -330,10 +342,12 @@ private:
       asio::error_code close_error_code;
       socket->close(close_error_code);
 
-      enqueue_to_dispatcher([this, credentials] {
-        peer_verification_failed(credentials);
-        schedule_reconnect();
-      });
+      notification_scope_.enqueue(
+          notification_token,
+          [this, credentials] {
+            peer_verification_failed(credentials);
+            schedule_reconnect();
+          });
       return;
     }
 
@@ -344,14 +358,14 @@ private:
     auto weak_self = weak_from_this();
     auto weak_p = make_weak(p);
 
-    p->received.connect([weak_self, weak_p](auto&& buffer) {
+    p->received.connect([weak_self, weak_p, notification_token](auto&& buffer) {
       if (auto self = weak_self.lock();
           self) {
         auto weak_self = self->weak_from_this();
 
         asio::post(
             self->io_ctx_,
-            [weak_self, weak_p, buffer] {
+            [weak_self, weak_p, buffer, notification_token] {
               auto self = weak_self.lock();
               auto p = weak_p.lock();
               if (!self ||
@@ -360,23 +374,24 @@ private:
                 return;
               }
 
-              self->enqueue_to_dispatcher([weak_self, buffer] {
-                if (auto self = weak_self.lock()) {
-                  self->received(buffer);
-                }
-              });
+              self->notification_scope_.enqueue(
+                  notification_token,
+                  [self, buffer] {
+                    self->received(buffer);
+                  });
             });
       }
     });
 
-    p->request_received.connect([weak_self, weak_p](auto request_id, auto&& buffer) {
+    p->request_received.connect([weak_self, weak_p, notification_token](auto request_id,
+                                                                        auto&& buffer) {
       if (auto self = weak_self.lock();
           self) {
         auto weak_self = self->weak_from_this();
 
         asio::post(
             self->io_ctx_,
-            [weak_self, weak_p, request_id, buffer] {
+            [weak_self, weak_p, request_id, buffer, notification_token] {
               auto self = weak_self.lock();
               auto p = weak_p.lock();
               if (!self ||
@@ -385,17 +400,18 @@ private:
                 return;
               }
 
-              self->enqueue_to_dispatcher([weak_self, request_id, buffer] {
-                if (auto self = weak_self.lock()) {
-                  self->request_received(request_id,
-                                         buffer);
-                }
-              });
+              self->notification_scope_.enqueue(
+                  notification_token,
+                  [self, request_id, buffer] {
+                    self->request_received(request_id,
+                                           buffer);
+                  });
             });
       }
     });
 
-    p->response_received.connect([weak_self, weak_p](auto request_id, auto&& buffer) {
+    p->response_received.connect([weak_self, weak_p](auto request_id,
+                                                     auto&& buffer) {
       if (auto self = weak_self.lock();
           self) {
         auto weak_self = self->weak_from_this();
@@ -416,14 +432,14 @@ private:
       }
     });
 
-    p->error_occurred.connect([weak_self, weak_p](auto&& error_code) {
+    p->error_occurred.connect([weak_self, weak_p, notification_token](auto&& error_code) {
       if (auto self = weak_self.lock();
           self) {
         auto weak_self = self->weak_from_this();
 
         asio::post(
             self->io_ctx_,
-            [weak_self, weak_p, error_code] {
+            [weak_self, weak_p, error_code, notification_token] {
               auto self = weak_self.lock();
               auto p = weak_p.lock();
               if (!self ||
@@ -434,23 +450,23 @@ private:
 
               self->request_manager_.complete_all(error_code);
 
-              self->enqueue_to_dispatcher([weak_self, error_code] {
-                if (auto self = weak_self.lock()) {
-                  self->error_occurred(error_code);
-                }
-              });
+              self->notification_scope_.enqueue(
+                  notification_token,
+                  [self, error_code] {
+                    self->error_occurred(error_code);
+                  });
             });
       }
     });
 
-    p->closed.connect([weak_self, weak_p] {
+    p->closed.connect([weak_self, weak_p, notification_token] {
       if (auto self = weak_self.lock();
           self) {
         auto weak_self = self->weak_from_this();
 
         asio::post(
             self->io_ctx_,
-            [weak_self, weak_p] {
+            [weak_self, weak_p, notification_token] {
               auto self = weak_self.lock();
               auto p = weak_p.lock();
               if (!self ||
@@ -462,12 +478,12 @@ private:
               self->request_manager_.complete_all(asio::error::connection_reset);
               self->peer_.reset();
 
-              self->enqueue_to_dispatcher([weak_self] {
-                if (auto self = weak_self.lock()) {
-                  self->closed();
-                  self->schedule_reconnect();
-                }
-              });
+              self->notification_scope_.enqueue(
+                  notification_token,
+                  [self] {
+                    self->closed();
+                    self->schedule_reconnect();
+                  });
             });
       }
     });
@@ -476,35 +492,30 @@ private:
 
     asio::post(
         io_ctx_,
-        [weak_self, weak_p, credentials, connection_generation] {
+        [weak_self, weak_p, credentials, notification_token] {
           auto self = weak_self.lock();
           auto p = weak_p.lock();
           if (self &&
               p &&
               self->peer_ == p) {
-            self->enqueue_to_dispatcher([weak_self, credentials, connection_generation] {
-              // Stop/invalidate can run after the I/O-side check but before
-              // this notification. Reject it even if the client restarted.
-              if (auto self = weak_self.lock();
-                  self &&
-                  !self->stopped_ &&
-                  self->connection_generation_ == connection_generation) {
-                self->connected(credentials);
-              }
-            });
+            self->notification_scope_.enqueue(
+                notification_token,
+                [self, credentials] {
+                  self->connected(credentials);
+                });
           }
         });
   }
 
   // This method is executed in the dispatcher thread.
   void schedule_reconnect() {
-    if (stopped_) {
+    if (!notification_scope_.running()) {
       return;
     }
 
     reconnect_task_.debounce_after(
         [this] {
-          if (stopped_) {
+          if (!notification_scope_.running()) {
             return;
           }
 
@@ -528,13 +539,15 @@ private:
     auto id = request_manager_.add(std::nullopt,
                                    timeout,
                                    callback,
-                                   [this] {
+                                   [this, notification_token = notification_scope_.capture()] {
                                      if (options_.invalidate_connection_on_request_error) {
                                        if (close_peer(asio::error::connection_reset)) {
-                                         enqueue_to_dispatcher([this] {
-                                           closed();
-                                           schedule_reconnect();
-                                         });
+                                         notification_scope_.enqueue(
+                                             notification_token,
+                                             [this] {
+                                               closed();
+                                               schedule_reconnect();
+                                             });
                                        }
                                      }
                                    });
@@ -559,9 +572,8 @@ private:
   std::filesystem::path socket_file_path_;
   client_options options_;
   std::function<bool(const peer_credentials&)> verify_peer_;
+  notification_scope notification_scope_;
   dispatcher::extra::debounced_task reconnect_task_;
-  std::atomic_bool stopped_ = true;
-  std::atomic_uint64_t connection_generation_ = 0;
 
   asio::io_context& io_ctx_;
   request_manager request_manager_;
@@ -591,7 +603,8 @@ public:
   nod::signal<void()>& closed;
   nod::signal<void(const asio::error_code&)>& error_occurred;
   nod::signal<void(not_null_shared_ptr_t<std::vector<uint8_t>>)>& received;
-  nod::signal<void(request_id, not_null_shared_ptr_t<std::vector<uint8_t>>)>& request_received;
+  nod::signal<void(request_id,
+                   not_null_shared_ptr_t<std::vector<uint8_t>>)>& request_received;
 
   client(const client&) = delete;
 

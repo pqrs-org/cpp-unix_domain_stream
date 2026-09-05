@@ -216,6 +216,7 @@ private:
   // This method is executed in the dispatcher thread.
   void stop() {
     stopped_ = true;
+    ++stop_generation_;
     bind_retry_task_.cancel();
     socket_path_health_check_timer_.stop();
     exposed_peer_ids_.clear();
@@ -330,6 +331,7 @@ private:
 
   // This method is executed in the shared I/O runtime thread.
   void handle_accepted_socket(asio::local::stream_protocol::socket socket) {
+    auto stop_generation = stop_generation_.load();
     if (stopped_) {
       asio::error_code close_error_code;
       socket.close(close_error_code);
@@ -346,10 +348,15 @@ private:
     auto weak_self = weak_from_this();
     auto weak_p = make_weak(p);
 
-    p->ready.connect([weak_self, id, credentials] {
+    p->ready.connect([weak_self, id, credentials, stop_generation] {
       if (auto self = weak_self.lock()) {
-        self->enqueue_to_dispatcher([weak_self, id, credentials] {
-          if (auto self = weak_self.lock()) {
+        self->enqueue_to_dispatcher([weak_self, id, credentials, stop_generation] {
+          // A queued ready notification must not expose a peer from before
+          // stop(), even if the server has already been started again.
+          if (auto self = weak_self.lock();
+              self &&
+              !self->stopped_ &&
+              self->stop_generation_ == stop_generation) {
             if (self->verify_peer_(credentials)) {
               self->exposed_peer_ids_.insert(id);
               self->peer_connected(id,
@@ -707,6 +714,9 @@ private:
   dispatcher::extra::debounced_task bind_retry_task_;
   dispatcher::extra::timer socket_path_health_check_timer_;
   std::atomic_bool stopped_ = true;
+  // Invalidate all old peers together; debouncing would drop independent
+  // ready notifications from concurrently connecting peers.
+  std::atomic_uint64_t stop_generation_ = 0;
 
   asio::io_context& io_ctx_;
   request_manager request_manager_;

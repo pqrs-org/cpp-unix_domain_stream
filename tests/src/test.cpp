@@ -28,6 +28,14 @@ public:
   }
 
   // Call on the I/O runtime thread.
+  static std::weak_ptr<peer> get_first_peer(server_state& server) {
+    if (server.peers_.empty()) {
+      return {};
+    }
+    return make_weak(server.peers_.begin()->second);
+  }
+
+  // Call on the I/O runtime thread.
   static void close_peer(server_state& server, peer_id id) {
     server.close_peer(id);
   }
@@ -2048,6 +2056,103 @@ int main() {
 
     dispatcher->terminate();
     dispatcher = nullptr;
+  };
+
+  "unix_domain_stream::server_stop_discards_pending_peer_ready"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::server_stop_discards_pending_peer_ready)" << std::endl;
+
+    // A ready notification from before stop must stay invalid after restart.
+    for (bool restart : {false, true}) {
+      auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+      auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+      prepare_socket_file_path(server_socket_file_path);
+      std::atomic_size_t verification_count = 0;
+      auto server = std::make_shared<pqrs::unix_domain_stream::impl::server_state>(
+          dispatcher, server_socket_file_path, make_options().server,
+          [&](const auto&) {
+            ++verification_count;
+            return true;
+          });
+      std::atomic_size_t bound_count = 0;
+      std::atomic_size_t connected_count = 0;
+      server->bound.connect([&] { ++bound_count; });
+      server->peer_connected.connect([&](auto, const auto&) { ++connected_count; });
+      server->async_start();
+      expect(wait_until([&] { return bound_count.load() == 1; }));
+
+      // Hold the dispatcher while a real connection queues its ready signal.
+      pqrs::dispatcher::extra::dispatcher_client blocker(dispatcher);
+      std::promise<void> first_started;
+      std::promise<void> first_release;
+      auto first_release_future = first_release.get_future().share();
+      blocker.enqueue_to_dispatcher([&] {
+        first_started.set_value();
+        first_release_future.wait();
+      });
+      first_started.get_future().wait();
+      asio::io_context io_ctx;
+      asio::local::stream_protocol::socket socket(io_ctx);
+      socket.connect(asio::local::stream_protocol::endpoint(server_socket_file_path));
+      std::weak_ptr<pqrs::unix_domain_stream::impl::peer> weak_peer;
+      expect(wait_until([&] {
+        std::promise<std::weak_ptr<pqrs::unix_domain_stream::impl::peer>> result;
+        asio::post(pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(), [&] {
+          result.set_value(pqrs::unix_domain_stream::impl::server_test_access::get_first_peer(*server));
+        });
+        weak_peer = result.get_future().get();
+        return !weak_peer.expired();
+      }));
+      // Allow the peer's 100 ms ready deadline to run on the I/O thread.
+      std::promise<void> ready_deadline_passed;
+      asio::post(pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(), [&] {
+        auto timer = std::make_shared<asio::steady_timer>(pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context());
+        timer->expires_after(std::chrono::milliseconds(200));
+        timer->async_wait([timer, &ready_deadline_passed](const auto&) { ready_deadline_passed.set_value(); });
+      });
+      ready_deadline_passed.get_future().wait();
+
+      // ready first queues the server callback behind stop and this second
+      // blocker. Wait for peer destruction before letting that callback run.
+      server->async_stop();
+      if (restart) {
+        server->async_start();
+      }
+      std::promise<void> second_started;
+      std::promise<void> second_release;
+      auto second_release_future = second_release.get_future().share();
+      blocker.enqueue_to_dispatcher([&] {
+        second_started.set_value();
+        second_release_future.wait();
+      });
+      first_release.set_value();
+      second_started.get_future().wait();
+      expect(wait_until([&] { return weak_peer.expired(); }));
+      second_release.set_value();
+      blocker.detach_from_dispatcher();
+
+      // No verification, connection notification, or exposed ID may survive.
+      std::promise<bool> exposed;
+      server->enqueue_to_dispatcher([&] {
+        exposed.set_value(pqrs::unix_domain_stream::impl::server_test_access::has_exposed_peer(*server, 1));
+      });
+      expect(!exposed.get_future().get());
+      expect(verification_count.load() == 0);
+      expect(connected_count.load() == 0);
+
+      // A new connection after restart must still be verified and reported.
+      if (restart) {
+        expect(wait_until([&] { return bound_count.load() == 2; }));
+        asio::local::stream_protocol::socket new_socket(io_ctx);
+        new_socket.connect(asio::local::stream_protocol::endpoint(server_socket_file_path));
+        expect(wait_until([&] { return connected_count.load() == 1; }));
+        expect(verification_count.load() == 1);
+        new_socket.close();
+      }
+      socket.close();
+      server->async_shutdown();
+      server.reset();
+      dispatcher->terminate();
+    }
   };
 
   "unix_domain_stream::server_local_close_cleans_up_before_peer_notification"_test = [] {

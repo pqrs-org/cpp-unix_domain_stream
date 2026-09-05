@@ -18,6 +18,11 @@ public:
   [[nodiscard]] static asio::io_context& get_io_context() {
     return runtime::get_io_context();
   }
+
+  // Call on the I/O runtime thread.
+  [[nodiscard]] static size_t socket_file_path_owner_count() {
+    return runtime::get_instance().socket_file_path_owners_.size();
+  }
 };
 
 class server_test_access final {
@@ -329,6 +334,73 @@ int main() {
     expect(lifetime_barrier_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
 
     dispatcher->terminate();
+  };
+
+  "unix_domain_stream::server_cleanup_uses_bound_socket_path"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::server_cleanup_uses_bound_socket_path)" << std::endl;
+
+    // Removing or retargeting the parent symlink must not orphan the old socket.
+    for (bool retarget : {false, true}) {
+      auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+      auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+      auto root = server_socket_file_path.parent_path() / ("path-owner-" + std::to_string(::getpid()));
+      auto old_path = root / "old" / "server.sock";
+      auto new_path = root / "new" / "server.sock";
+      auto link = root / "link";
+      std::filesystem::create_directories(old_path.parent_path());
+      std::filesystem::create_directories(new_path.parent_path());
+      std::filesystem::create_directory_symlink(std::filesystem::absolute(old_path.parent_path()), link);
+
+      // This also acts as an I/O barrier after asynchronous server destruction.
+      auto owner_count = [] {
+        std::promise<size_t> result;
+        asio::post(pqrs::unix_domain_stream::impl::runtime_test_access::get_io_context(), [&] {
+          result.set_value(pqrs::unix_domain_stream::impl::runtime_test_access::socket_file_path_owner_count());
+        });
+        return result.get_future().get();
+      };
+      auto baseline = owner_count();
+      auto options = pqrs::unix_domain_stream::server_options(
+          {}, {.socket_path_health_check_interval = std::chrono::hours(1)});
+      auto old_server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher, link / "server.sock", options);
+      std::promise<void> old_bound;
+      old_server->bound.connect([&] { old_bound.set_value(); });
+      old_server->async_start();
+      expect(old_bound.get_future().wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+      expect(std::filesystem::exists(old_path));
+      expect(owner_count() == baseline + 1);
+
+      // A new server at the retargeted path must survive the old server's cleanup.
+      std::filesystem::remove(link);
+      std::unique_ptr<pqrs::unix_domain_stream::server> new_server;
+      std::promise<void> new_bound;
+      if (retarget) {
+        std::filesystem::create_directory_symlink(std::filesystem::absolute(new_path.parent_path()), link);
+        new_server = std::make_unique<pqrs::unix_domain_stream::server>(dispatcher, link / "server.sock", options);
+        new_server->bound.connect([&] { new_bound.set_value(); });
+        new_server->async_start();
+        expect(new_bound.get_future().wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+      }
+      old_server.reset();
+      expect(owner_count() == baseline + (retarget ? 1 : 0));
+      expect(!std::filesystem::exists(old_path));
+      if (retarget) {
+        expect(std::filesystem::exists(new_path));
+        asio::io_context io_ctx;
+        asio::local::stream_protocol::socket socket(io_ctx);
+        asio::error_code error_code;
+        socket.connect(asio::local::stream_protocol::endpoint(link / "server.sock"), error_code);
+        expect(!error_code);
+        socket.close();
+      }
+
+      // Destruction must release both the file and the runtime ownership entry.
+      new_server.reset();
+      expect(owner_count() == baseline);
+      expect(!std::filesystem::exists(new_path));
+      dispatcher->terminate();
+      std::filesystem::remove_all(root);
+    }
   };
 
   "unix_domain_stream::old_server_shutdown_does_not_remove_new_server_socket_path"_test = [] {

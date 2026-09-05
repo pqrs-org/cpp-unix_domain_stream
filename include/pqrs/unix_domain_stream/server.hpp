@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <functional>
 #include <nod/nod.hpp>
+#include <optional>
 #include <pqrs/dispatcher.hpp>
 #include <unordered_map>
 #include <unordered_set>
@@ -249,6 +250,7 @@ private:
           }
 
           runtime::remove_socket_file_path(self->socket_file_path_);
+          auto resolved_socket_file_path = runtime::make_socket_file_path_key(self->socket_file_path_);
 
           self->acceptor_ = std::make_unique<asio::local::stream_protocol::acceptor>(self->io_ctx_);
 
@@ -267,7 +269,8 @@ private:
             return;
           }
 
-          runtime::set_socket_file_path_owner(self->socket_file_path_,
+          self->bound_socket_file_path_ = std::move(resolved_socket_file_path);
+          runtime::set_socket_file_path_owner(*self->bound_socket_file_path_,
                                               self.get());
 
           self->acceptor_->listen(asio::socket_base::max_listen_connections,
@@ -484,8 +487,11 @@ private:
       acceptor_.reset();
     }
 
-    runtime::remove_socket_file_path_if_owned(socket_file_path_,
-                                              this);
+    if (bound_socket_file_path_) {
+      runtime::remove_socket_file_path_if_owned(*bound_socket_file_path_,
+                                                this);
+      bound_socket_file_path_.reset();
+    }
   }
 
   // This method is executed in the dispatcher thread.
@@ -721,6 +727,11 @@ private:
   asio::io_context& io_ctx_;
   request_manager request_manager_;
   std::unique_ptr<asio::local::stream_protocol::acceptor> acceptor_;
+  // Remember the absolute path resolved when the socket file was created.
+  // If a symlink in an intermediate directory changes while the server is
+  // running, resolving socket_file_path_ again may produce a different path.
+  // Cleanup must use this saved path to remove the original socket file.
+  std::optional<std::filesystem::path> bound_socket_file_path_;
   std::unordered_map<peer_id, not_null_shared_ptr_t<peer>> peers_;
   std::unordered_set<peer_id> exposed_peer_ids_;
   std::shared_ptr<peer> socket_path_health_check_peer_;

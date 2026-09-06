@@ -173,14 +173,6 @@ public:
             return;
           }
 
-          if (!self->peer_) {
-            self->enqueue_to_dispatcher([callback] {
-              callback(asio::error::not_connected,
-                       nullptr);
-            });
-            return;
-          }
-
           self->send_request(data,
                              timeout,
                              callback);

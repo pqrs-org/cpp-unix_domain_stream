@@ -91,50 +91,32 @@ public:
   }
 
   void async_send(const std::vector<uint8_t>& data) {
-    auto frame = protocol::make_user_data_frame(data);
-
-    asio::post(
-        socket_.get_executor(),
-        [self = shared_from_this(), frame = std::move(frame)] {
-          self->push_frame(frame);
-        });
+    async_push_frame(protocol::make_user_data_frame(data));
   }
 
   void async_send_request(uint64_t request_id,
                           const std::vector<uint8_t>& data) {
-    auto frame = protocol::make_request_frame(request_id,
-                                              data);
-
-    asio::post(
-        socket_.get_executor(),
-        [self = shared_from_this(), frame = std::move(frame)] {
-          self->push_frame(frame);
-        });
+    async_push_frame(protocol::make_request_frame(request_id, data));
   }
 
   void async_send_response(uint64_t request_id,
                            const std::vector<uint8_t>& data) {
-    auto frame = protocol::make_response_frame(request_id,
-                                               data);
-
-    asio::post(
-        socket_.get_executor(),
-        [self = shared_from_this(), frame = std::move(frame)] {
-          self->push_frame(frame);
-        });
+    async_push_frame(protocol::make_response_frame(request_id, data));
   }
 
   void async_send_health_check() {
-    auto frame = protocol::make_health_check_frame();
-
-    asio::post(
-        socket_.get_executor(),
-        [self = shared_from_this(), frame = std::move(frame)] {
-          self->push_frame(frame);
-        });
+    async_push_frame(protocol::make_health_check_frame());
   }
 
 private:
+  void async_push_frame(std::vector<uint8_t> frame) {
+    asio::post(
+        socket_.get_executor(),
+        [self = shared_from_this(), frame = std::move(frame)]() mutable {
+          self->push_frame(std::move(frame));
+        });
+  }
+
   // This method is executed in `io_ctx_thread_`.
   void start_heartbeat_timer() {
     heartbeat_timer_.expires_after(normalize_scheduling_interval(options_.heartbeat_interval));

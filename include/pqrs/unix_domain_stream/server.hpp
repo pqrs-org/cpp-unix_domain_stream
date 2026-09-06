@@ -112,7 +112,6 @@ public:
             shared_self->socket_path_health_check_peer_->disconnect_all_signal_slots();
           }
           shared_self->close_socket_path_health_check_peer();
-          shared_self->socket_path_health_check_in_progress_ = false;
 
           // Keep state alive through the cancellation handlers queued by the
           // acceptor, sockets, and timers closed above.
@@ -240,7 +239,6 @@ private:
             self->close_acceptor();
             self->close_all_peers();
             self->close_socket_path_health_check_peer();
-            self->socket_path_health_check_in_progress_ = false;
           }
         });
   }
@@ -553,6 +551,9 @@ private:
   }
 
   // This method is executed in the dispatcher thread.
+  // Use a fresh connection for each probe to verify that the socket path still
+  // accepts new connections. Reusing an established connection would not detect
+  // an unlinked or replaced socket path. Close the probe connection on completion.
   void socket_path_health_check() {
     auto weak_self = weak_from_this();
     auto notification_token = notification_scope_.capture();
@@ -564,37 +565,38 @@ private:
           if (!self ||
               !self->notification_scope_.is_current(notification_token) ||
               !self->acceptor_ ||
-              self->socket_path_health_check_in_progress_) {
+              self->socket_path_health_check_timeout_) {
             return;
           }
 
-          self->socket_path_health_check_in_progress_ = true;
+          auto timeout = std::make_shared<asio::steady_timer>(self->io_ctx_);
+          self->socket_path_health_check_timeout_ = timeout;
           asio::error_code endpoint_error_code;
           auto endpoint = asio_helper::make_endpoint(self->socket_file_path_,
                                                      endpoint_error_code);
           if (endpoint_error_code) {
             self->handle_socket_path_health_check_failed(endpoint_error_code,
-                                                         notification_token);
+                                                         notification_token, timeout);
             return;
           }
 
           not_null_shared_ptr_t<asio::local::stream_protocol::socket> socket(std::make_shared<asio::local::stream_protocol::socket>(self->io_ctx_));
-          not_null_shared_ptr_t<asio::steady_timer> timeout(std::make_shared<asio::steady_timer>(self->io_ctx_));
 
           timeout->expires_after(self->options_.socket_path_health_check_timeout);
-          timeout->async_wait([self, socket, notification_token](const auto& error_code) {
+          timeout->async_wait([self, socket, timeout, notification_token](const auto& error_code) {
+            // Cancellation must also close a probe whose connect is still pending.
+            asio::error_code close_error_code;
+            socket->close(close_error_code);
             if (!error_code) {
-              asio::error_code close_error_code;
-              socket->close(close_error_code);
               self->handle_socket_path_health_check_failed(asio::error::timed_out,
-                                                           notification_token);
+                                                           notification_token, timeout);
             }
           });
 
           socket->async_connect(
               endpoint,
               [self, socket, timeout, notification_token](auto&& error_code) mutable {
-                if (!self->notification_scope_.is_current(notification_token)) {
+                if (!self->is_current_socket_path_health_check(notification_token, timeout)) {
                   timeout->cancel();
 
                   asio::error_code close_error_code;
@@ -605,7 +607,7 @@ private:
                 if (error_code) {
                   timeout->cancel();
                   self->handle_socket_path_health_check_failed(error_code,
-                                                               notification_token);
+                                                               notification_token, timeout);
                   return;
                 }
 
@@ -622,12 +624,8 @@ private:
                         self->io_ctx_,
                         [weak_self, timeout, notification_token] {
                           if (auto self = weak_self.lock();
-                              self && self->notification_scope_.is_current(notification_token)) {
-                            timeout->cancel();
-
+                              self && self->is_current_socket_path_health_check(notification_token, timeout)) {
                             self->close_socket_path_health_check_peer();
-
-                            self->socket_path_health_check_in_progress_ = false;
                           }
                         });
                   }
@@ -639,11 +637,9 @@ private:
                     asio::post(
                         self->io_ctx_,
                         [weak_self, timeout, error_code, notification_token] {
-                          if (auto self = weak_self.lock();
-                              self && self->notification_scope_.is_current(notification_token)) {
-                            timeout->cancel();
+                          if (auto self = weak_self.lock()) {
                             self->handle_socket_path_health_check_failed(error_code,
-                                                                         notification_token);
+                                                                         notification_token, timeout);
                           }
                         });
                   }
@@ -655,14 +651,9 @@ private:
                     asio::post(
                         self->io_ctx_,
                         [weak_self, timeout, notification_token] {
-                          if (auto self = weak_self.lock();
-                              self && self->notification_scope_.is_current(notification_token)) {
-                            timeout->cancel();
-
-                            if (self->socket_path_health_check_in_progress_) {
-                              self->handle_socket_path_health_check_failed(asio::error::eof,
-                                                                           notification_token);
-                            }
+                          if (auto self = weak_self.lock()) {
+                            self->handle_socket_path_health_check_failed(asio::error::eof,
+                                                                         notification_token, timeout);
                           }
                         });
                   }
@@ -675,14 +666,20 @@ private:
   }
 
   // This method is executed in the shared I/O runtime thread.
+  [[nodiscard]] bool is_current_socket_path_health_check(
+      notification_scope::token notification_token,
+      const std::shared_ptr<asio::steady_timer>& timeout) const noexcept {
+    return notification_scope_.is_current(notification_token) &&
+           socket_path_health_check_timeout_ == timeout;
+  }
+
+  // This method is executed in the shared I/O runtime thread.
   void handle_socket_path_health_check_failed(const asio::error_code&,
-                                              notification_scope::token notification_token) {
-    if (!notification_scope_.is_current(notification_token) ||
-        !socket_path_health_check_in_progress_) {
+                                              notification_scope::token notification_token,
+                                              const std::shared_ptr<asio::steady_timer>& timeout) {
+    if (!is_current_socket_path_health_check(notification_token, timeout)) {
       return;
     }
-
-    socket_path_health_check_in_progress_ = false;
 
     close_socket_path_health_check_peer();
 
@@ -726,6 +723,11 @@ private:
 
   // This method is executed in the shared I/O runtime thread.
   void close_socket_path_health_check_peer() {
+    if (socket_path_health_check_timeout_) {
+      socket_path_health_check_timeout_->cancel();
+      socket_path_health_check_timeout_.reset();
+    }
+
     if (socket_path_health_check_peer_) {
       socket_path_health_check_peer_->async_close();
       socket_path_health_check_peer_.reset();
@@ -780,7 +782,9 @@ private:
   std::unordered_map<peer_id, not_null_shared_ptr_t<peer>> peers_;
   std::unordered_set<peer_id> exposed_peer_ids_;
   std::shared_ptr<peer> socket_path_health_check_peer_;
-  bool socket_path_health_check_in_progress_ = false;
+  // The active timer also identifies the individual probe on the I/O thread.
+  // Late callbacks from a completed probe must not affect its successor.
+  std::shared_ptr<asio::steady_timer> socket_path_health_check_timeout_;
   peer_id next_peer_id_ = 0;
   std::atomic_bool shutdown_started_ = false;
 };

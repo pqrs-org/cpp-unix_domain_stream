@@ -66,7 +66,7 @@ public:
 
   // Call on the I/O runtime thread.
   [[nodiscard]] static bool socket_path_health_check_in_progress(server_state& server) {
-    return server.socket_path_health_check_in_progress_;
+    return server.socket_path_health_check_timeout_ != nullptr;
   }
 
   // Call on the I/O runtime thread.
@@ -74,12 +74,13 @@ public:
     return server.acceptor_ && server.acceptor_->is_open();
   }
 
-  // Capture the same session as the timeout handler, then invoke on the I/O
-  // thread after restart without depending on wall-clock timer ordering.
+  // Capture the timeout handler's session and probe, then invoke on the I/O
+  // thread after the next probe starts without depending on timer ordering.
   static std::function<void()> make_socket_path_health_check_timeout(server_state& server) {
     auto token = server.notification_scope_.capture();
-    return [&server, token] {
-      server.handle_socket_path_health_check_failed(asio::error::timed_out, token);
+    auto timeout = server.socket_path_health_check_timeout_;
+    return [&server, token, timeout] {
+      server.handle_socket_path_health_check_failed(asio::error::timed_out, token, timeout);
     };
   }
 
@@ -3231,8 +3232,8 @@ int main() {
     dispatcher = nullptr;
   };
 
-  "unix_domain_stream::server_ignores_old_health_check_after_restart"_test = [] {
-    std::cout << "TEST_CASE(unix_domain_stream::server_ignores_old_health_check_after_restart)" << std::endl;
+  "unix_domain_stream::server_ignores_old_health_check"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::server_ignores_old_health_check)" << std::endl;
 
     enum class late_event { response,
                             error,
@@ -3242,141 +3243,147 @@ int main() {
     using protocol = asio::local::stream_protocol;
     namespace framing = pqrs::unix_domain_stream::impl::protocol;
 
-    for (auto event : {late_event::response, late_event::error, late_event::closed, late_event::timeout}) {
-      // Keep automatic deadlines out of the way. Each health check is started
-      // explicitly through the same entry point used by the periodic timer.
-      auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
-      auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
-      prepare_socket_file_path(server_socket_file_path);
-      pqrs::unix_domain_stream::server_options options(
-          {.heartbeat_timeout = std::chrono::hours(1),
-           .read_timeout = std::chrono::hours(1),
-           .write_timeout = std::chrono::hours(1)},
-          {.socket_path_health_check_interval = std::chrono::hours(1),
-           .socket_path_health_check_timeout = std::chrono::hours(1)});
-      auto server = std::make_shared<pqrs::unix_domain_stream::impl::server_state>(
-          dispatcher, server_socket_file_path, options, pqrs::unix_domain_stream::default_verify_peer);
-      std::atomic_size_t bound_count = 0;
-      std::atomic_size_t closed_count = 0;
-      server->bound.connect([&] { ++bound_count; });
-      server->closed.connect([&] { ++closed_count; });
-      server->async_start();
-      expect(wait_until([&] { return bound_count.load() == 1; }));
+    for (bool restart : {false, true}) {
+      for (auto event : {late_event::response, late_event::error, late_event::closed, late_event::timeout}) {
+        // Keep automatic deadlines out of the way. Each health check is started
+        // explicitly through the same entry point used by the periodic timer.
+        auto time_source = std::make_shared<pqrs::dispatcher::hardware_time_source>();
+        auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(time_source);
+        prepare_socket_file_path(server_socket_file_path);
+        pqrs::unix_domain_stream::server_options options(
+            {.heartbeat_timeout = std::chrono::hours(1),
+             .read_timeout = std::chrono::hours(1),
+             .write_timeout = std::chrono::hours(1)},
+            {.socket_path_health_check_interval = std::chrono::hours(1),
+             .socket_path_health_check_timeout = std::chrono::hours(1)});
+        auto server = std::make_shared<pqrs::unix_domain_stream::impl::server_state>(
+            dispatcher, server_socket_file_path, options, pqrs::unix_domain_stream::default_verify_peer);
+        std::atomic_size_t bound_count = 0;
+        std::atomic_size_t closed_count = 0;
+        server->bound.connect([&] { ++bound_count; });
+        server->closed.connect([&] { ++closed_count; });
+        server->async_start();
+        expect(wait_until([&] { return bound_count.load() == 1; }));
 
-      // Replace only the filesystem endpoint with a controllable raw listener.
-      // The server keeps its acceptor, while we decide when each probe responds.
-      asio::io_context io_ctx;
-      protocol::acceptor listener(io_ctx);
-      auto replace_listener = [&] {
-        if (listener.is_open()) {
-          listener.close();
-        }
-        std::filesystem::remove(server_socket_file_path);
-        auto endpoint = protocol::endpoint(server_socket_file_path);
-        listener.open(endpoint.protocol());
-        listener.bind(endpoint);
-        listener.listen();
-        listener.non_blocking(true);
-      };
-      auto start_probe = [&](protocol::socket& socket) {
-        server->enqueue_to_dispatcher([&] { access::start_socket_path_health_check(*server); });
-        asio::error_code error_code;
-        bool accepted = wait_until([&] {
-          listener.accept(socket, error_code);
-          return !error_code;
-        });
-        expect(accepted);
-        if (!accepted) {
-          return false;
-        }
-        socket.non_blocking(true);
-        auto expected = framing::make_health_check_frame();
-        std::vector<uint8_t> frame(expected.size());
-        size_t received = 0;
-        expect(wait_until([&] {
-          received += socket.read_some(asio::buffer(frame.data() + received, frame.size() - received), error_code);
-          return received == frame.size();
-        }));
-        expect(frame == expected);
-        return received == frame.size();
-      };
-      auto finish_probe = [&](protocol::socket& socket) {
-        auto response = framing::make_health_check_response_frame();
-        asio::error_code error_code;
-        asio::write(socket, asio::buffer(response), error_code);
-        expect(!error_code);
-        expect(wait_until([&] {
-          return invoke_on_io_context([&] { return !access::socket_path_health_check_in_progress(*server); });
-        }));
-        socket.close();
-      };
-      replace_listener();
-      protocol::socket old_socket(io_ctx);
-      auto old_started = start_probe(old_socket);
-      auto old_peer = invoke_on_io_context([&] { return access::get_socket_path_health_check_peer(*server); });
-      auto old_timeout = invoke_on_io_context([&] { return access::make_socket_path_health_check_timeout(*server); });
-      expect(old_started && old_peer != nullptr);
-
-      // Retain the old peer's signal slots while stop closes its socket. Start
-      // a new probe after restart, before delivering the old completion.
-      server->async_stop();
-      server->async_start();
-      expect(wait_until([&] { return bound_count.load() == 2; }));
-      replace_listener();
-      protocol::socket new_socket(io_ctx);
-      auto new_started = start_probe(new_socket);
-      auto new_peer = invoke_on_io_context([&] { return access::get_socket_path_health_check_peer(*server); });
-      expect(new_started && new_peer != nullptr && new_peer != old_peer);
-      if (old_peer && new_peer) {
-        if (event == late_event::timeout) {
-          invoke_on_io_context(old_timeout);
-        } else {
-          server->enqueue_to_dispatcher([old_peer, event] {
-            switch (event) {
-              case late_event::response:
-                old_peer->health_check_response_received();
-                break;
-              case late_event::error:
-                old_peer->error_occurred(asio::error::connection_reset);
-                break;
-              case late_event::closed:
-                old_peer->closed();
-                break;
-              case late_event::timeout:
-                break;
-            }
+        // Replace only the filesystem endpoint with a controllable raw listener.
+        // The server keeps its acceptor, while we decide when each probe responds.
+        asio::io_context io_ctx;
+        protocol::acceptor listener(io_ctx);
+        auto replace_listener = [&] {
+          if (listener.is_open()) {
+            listener.close();
+          }
+          std::filesystem::remove(server_socket_file_path);
+          auto endpoint = protocol::endpoint(server_socket_file_path);
+          listener.open(endpoint.protocol());
+          listener.bind(endpoint);
+          listener.listen();
+          listener.non_blocking(true);
+        };
+        auto start_probe = [&](protocol::socket& socket) {
+          server->enqueue_to_dispatcher([&] { access::start_socket_path_health_check(*server); });
+          asio::error_code error_code;
+          bool accepted = wait_until([&] {
+            listener.accept(socket, error_code);
+            return !error_code;
           });
-          expect(wait_dispatcher_barrier(dispatcher));
-        }
-        bool new_probe_unchanged = invoke_on_io_context([&] {
-          return access::get_socket_path_health_check_peer(*server) == new_peer &&
-                 access::socket_path_health_check_in_progress(*server) &&
-                 access::acceptor_is_open(*server);
-        });
-        expect(new_probe_unchanged);
-        expect(wait_dispatcher_barrier(dispatcher));
-        expect(closed_count.load() == 0);
-        expect(bound_count.load() == 2);
+          expect(accepted);
+          if (!accepted) {
+            return false;
+          }
+          socket.non_blocking(true);
+          auto expected = framing::make_health_check_frame();
+          std::vector<uint8_t> frame(expected.size());
+          size_t received = 0;
+          expect(wait_until([&] {
+            received += socket.read_some(asio::buffer(frame.data() + received, frame.size() - received), error_code);
+            return received == frame.size();
+          }));
+          expect(frame == expected);
+          return received == frame.size();
+        };
+        auto finish_probe = [&](protocol::socket& socket) {
+          auto response = framing::make_health_check_response_frame();
+          asio::error_code error_code;
+          asio::write(socket, asio::buffer(response), error_code);
+          expect(!error_code);
+          expect(wait_until([&] {
+            return invoke_on_io_context([&] { return !access::socket_path_health_check_in_progress(*server); });
+          }));
+          socket.close();
+        };
+        replace_listener();
+        protocol::socket old_socket(io_ctx);
+        auto old_started = start_probe(old_socket);
+        auto old_peer = invoke_on_io_context([&] { return access::get_socket_path_health_check_peer(*server); });
+        auto old_timeout = invoke_on_io_context([&] { return access::make_socket_path_health_check_timeout(*server); });
+        expect(old_started && old_peer != nullptr);
 
-        // The new response must still finish its probe, and a subsequent probe
-        // must also work. This catches a stale in-progress flag or lost acceptor.
-        if (new_probe_unchanged && new_started) {
-          finish_probe(new_socket);
-          protocol::socket next_socket(io_ctx);
-          if (start_probe(next_socket)) {
-            finish_probe(next_socket);
+        // Keep the old signal slots alive and deliver a late callback after the
+        // next probe starts. Cover both normal consecutive probes and stop/restart.
+        if (restart) {
+          server->async_stop();
+          server->async_start();
+          expect(wait_until([&] { return bound_count.load() == 2; }));
+          replace_listener();
+        } else {
+          finish_probe(old_socket);
+        }
+        protocol::socket new_socket(io_ctx);
+        auto new_started = start_probe(new_socket);
+        auto new_peer = invoke_on_io_context([&] { return access::get_socket_path_health_check_peer(*server); });
+        expect(new_started && new_peer != nullptr && new_peer != old_peer);
+        if (old_peer && new_peer) {
+          if (event == late_event::timeout) {
+            invoke_on_io_context(old_timeout);
+          } else {
+            server->enqueue_to_dispatcher([old_peer, event] {
+              switch (event) {
+                case late_event::response:
+                  old_peer->health_check_response_received();
+                  break;
+                case late_event::error:
+                  old_peer->error_occurred(asio::error::connection_reset);
+                  break;
+                case late_event::closed:
+                  old_peer->closed();
+                  break;
+                case late_event::timeout:
+                  break;
+              }
+            });
+            expect(wait_dispatcher_barrier(dispatcher));
+          }
+          bool new_probe_unchanged = invoke_on_io_context([&] {
+            return access::get_socket_path_health_check_peer(*server) == new_peer &&
+                   access::socket_path_health_check_in_progress(*server) &&
+                   access::acceptor_is_open(*server);
+          });
+          expect(new_probe_unchanged);
+          expect(wait_dispatcher_barrier(dispatcher));
+          expect(closed_count.load() == 0);
+          expect(bound_count.load() == (restart ? 2u : 1u));
+
+          // The new response must still finish its probe, and a subsequent probe
+          // must also work. This catches stale active-probe state or a lost acceptor.
+          if (new_probe_unchanged && new_started) {
+            finish_probe(new_socket);
+            protocol::socket next_socket(io_ctx);
+            if (start_probe(next_socket)) {
+              finish_probe(next_socket);
+            }
           }
         }
+        old_peer.reset();
+        new_peer.reset();
+        old_socket.close();
+        new_socket.close();
+        listener.close();
+        server->async_shutdown();
+        server.reset();
+        invoke_on_io_context([] {});
+        dispatcher->terminate();
       }
-      old_peer.reset();
-      new_peer.reset();
-      old_socket.close();
-      new_socket.close();
-      listener.close();
-      server->async_shutdown();
-      server.reset();
-      invoke_on_io_context([] {});
-      dispatcher->terminate();
     }
   };
 

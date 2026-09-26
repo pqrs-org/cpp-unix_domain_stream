@@ -7,6 +7,7 @@
 #include <iostream>
 #include <pqrs/unix_domain_stream.hpp>
 #include <pqrs/unix_domain_stream/impl/protocol.hpp>
+#include <stdexcept>
 #include <thread>
 #include <type_traits>
 #include <unistd.h>
@@ -268,6 +269,30 @@ private:
 int main() {
   using namespace boost::ut;
   using namespace boost::ut::literals;
+
+  "constructor verifier copy exception"_test = [] {
+    struct throwing_verifier {
+      throwing_verifier() = default;
+      throwing_verifier(const throwing_verifier&) {
+        throw std::runtime_error("verifier copy failed");
+      }
+      throwing_verifier(throwing_verifier&&) = default;
+      bool operator()(const pqrs::unix_domain_stream::peer_credentials&) const {
+        return true;
+      }
+    };
+
+    auto source = std::make_shared<pqrs::dispatcher::pseudo_time_source>();
+    auto dispatcher = std::make_shared<pqrs::dispatcher::dispatcher>(source);
+    // Move into the public constructor; the copy into the state member throws
+    // after both dispatcher_client bases have attached.
+    expect(throws<std::runtime_error>([&] {
+      pqrs::unix_domain_stream::client client(dispatcher, "unused.sock", {}, throwing_verifier{});
+    }));
+    expect(throws<std::runtime_error>([&] {
+      pqrs::unix_domain_stream::server server(dispatcher, "unused.sock", {}, throwing_verifier{});
+    }));
+  };
 
   "unix_domain_stream::request_manager_ignores_completed_request_timeout"_test = [] {
     std::cout << "TEST_CASE(unix_domain_stream::request_manager_ignores_completed_request_timeout)" << std::endl;
@@ -2159,7 +2184,7 @@ int main() {
     expect(status == std::future_status::timeout);
 
     if (status == std::future_status::ready) {
-      future.get();
+      static_cast<void>(future.get());
     } else {
       server->async_close_peer(target_peer_id);
       expect(future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready);

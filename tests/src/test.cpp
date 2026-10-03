@@ -102,25 +102,25 @@ const std::filesystem::path server_socket_file_path =
 using async_request_test_result = std::pair<asio::error_code, std::shared_ptr<std::vector<uint8_t>>>;
 
 struct test_options final {
-  struct initialization_parameters final {
-    pqrs::unix_domain_stream::common_options::initialization_parameters common;
-    pqrs::unix_domain_stream::client_options::initialization_parameters client;
-    pqrs::unix_domain_stream::server_options::initialization_parameters server;
+  struct parameters final {
+    pqrs::unix_domain_stream::common_options::parameters common;
+    pqrs::unix_domain_stream::client_options::parameters client;
+    pqrs::unix_domain_stream::server_options::parameters server;
   };
 
   test_options() = default;
 
-  explicit test_options(const initialization_parameters& parameters)
+  explicit test_options(const parameters& parameters)
       : client(parameters.common,
                parameters.client),
         server(parameters.common,
                parameters.server) {
   }
 
-  static initialization_parameters make_parameters(
-      const pqrs::unix_domain_stream::common_options::initialization_parameters& common,
-      const pqrs::unix_domain_stream::client_options::initialization_parameters& client,
-      const pqrs::unix_domain_stream::server_options::initialization_parameters& server) {
+  static parameters make_parameters(
+      const pqrs::unix_domain_stream::common_options::parameters& common,
+      const pqrs::unix_domain_stream::client_options::parameters& client,
+      const pqrs::unix_domain_stream::server_options::parameters& server) {
     return {
         .common = common,
         .client = client,
@@ -347,10 +347,10 @@ int main() {
     }
   };
 
-  "unix_domain_stream::options_initialization_parameters"_test = [] {
-    std::cout << "TEST_CASE(unix_domain_stream::options_initialization_parameters)" << std::endl;
+  "unix_domain_stream::options_parameters"_test = [] {
+    std::cout << "TEST_CASE(unix_domain_stream::options_parameters)" << std::endl;
 
-    pqrs::unix_domain_stream::common_options::initialization_parameters common_parameters{
+    pqrs::unix_domain_stream::common_options::parameters common_parameters{
         .max_message_size = 123,
         .max_send_queue_size = 456,
         .heartbeat_interval = std::chrono::milliseconds(456),
@@ -363,38 +363,38 @@ int main() {
     // Ensure every client initialization parameter is copied into client_options as-is.
     pqrs::unix_domain_stream::client_options client_options(
         common_parameters,
-        pqrs::unix_domain_stream::client_options::initialization_parameters{
+        pqrs::unix_domain_stream::client_options::parameters{
             .reconnect_interval = std::chrono::milliseconds(789),
         });
 
-    expect(client_options.max_message_size == 123_i);
-    expect(client_options.max_send_queue_size == 456_i);
-    expect(client_options.reconnect_interval == std::chrono::milliseconds(789));
-    expect(client_options.heartbeat_interval == std::chrono::milliseconds(456));
-    expect(client_options.heartbeat_timeout == std::chrono::milliseconds(567));
-    expect(client_options.read_timeout == std::chrono::milliseconds(678));
-    expect(client_options.write_timeout == std::chrono::milliseconds(890));
-    expect(client_options.invalidate_connection_on_request_error == false);
+    expect(client_options.common_parameters.max_message_size == 123_i);
+    expect(client_options.common_parameters.max_send_queue_size == 456_i);
+    expect(client_options.client_parameters.reconnect_interval == std::chrono::milliseconds(789));
+    expect(client_options.common_parameters.heartbeat_interval == std::chrono::milliseconds(456));
+    expect(client_options.common_parameters.heartbeat_timeout == std::chrono::milliseconds(567));
+    expect(client_options.common_parameters.read_timeout == std::chrono::milliseconds(678));
+    expect(client_options.common_parameters.write_timeout == std::chrono::milliseconds(890));
+    expect(client_options.common_parameters.invalidate_connection_on_request_error == false);
 
     // Ensure every server initialization parameter is copied into server_options as-is.
     pqrs::unix_domain_stream::server_options server_options(
         common_parameters,
-        pqrs::unix_domain_stream::server_options::initialization_parameters{
+        pqrs::unix_domain_stream::server_options::parameters{
             .bind_retry_interval = std::chrono::milliseconds(789),
             .socket_path_health_check_interval = std::chrono::milliseconds(234),
             .socket_path_health_check_timeout = std::chrono::milliseconds(345),
         });
 
-    expect(server_options.max_message_size == 123_i);
-    expect(server_options.max_send_queue_size == 456_i);
-    expect(server_options.bind_retry_interval == std::chrono::milliseconds(789));
-    expect(server_options.socket_path_health_check_interval == std::chrono::milliseconds(234));
-    expect(server_options.socket_path_health_check_timeout == std::chrono::milliseconds(345));
-    expect(server_options.heartbeat_interval == std::chrono::milliseconds(456));
-    expect(server_options.heartbeat_timeout == std::chrono::milliseconds(567));
-    expect(server_options.read_timeout == std::chrono::milliseconds(678));
-    expect(server_options.write_timeout == std::chrono::milliseconds(890));
-    expect(server_options.invalidate_connection_on_request_error == false);
+    expect(server_options.common_parameters.max_message_size == 123_i);
+    expect(server_options.common_parameters.max_send_queue_size == 456_i);
+    expect(server_options.server_parameters.bind_retry_interval == std::chrono::milliseconds(789));
+    expect(server_options.server_parameters.socket_path_health_check_interval == std::chrono::milliseconds(234));
+    expect(server_options.server_parameters.socket_path_health_check_timeout == std::chrono::milliseconds(345));
+    expect(server_options.common_parameters.heartbeat_interval == std::chrono::milliseconds(456));
+    expect(server_options.common_parameters.heartbeat_timeout == std::chrono::milliseconds(567));
+    expect(server_options.common_parameters.read_timeout == std::chrono::milliseconds(678));
+    expect(server_options.common_parameters.write_timeout == std::chrono::milliseconds(890));
+    expect(server_options.common_parameters.invalidate_connection_on_request_error == false);
   };
 
   "unix_domain_stream::destruction_does_not_wait_for_io_context"_test = [] {
@@ -1710,8 +1710,8 @@ int main() {
     });
 
     auto options = make_options();
-    options.client.heartbeat_interval = std::chrono::milliseconds(1000);
-    options.client.heartbeat_timeout = std::chrono::milliseconds(1000);
+    options.client.common_parameters.heartbeat_interval = std::chrono::milliseconds(1000);
+    options.client.common_parameters.heartbeat_timeout = std::chrono::milliseconds(1000);
 
     // A default-constructed socket is already closed. async_start still arms
     // the peer timers, so async_close must cancel them even though there is no
@@ -3659,7 +3659,7 @@ int main() {
     // The declared body size must fit within the configured payload limit.
     // This rejects oversized frames before allocating a matching read buffer.
     send_malformed_frame({
-        .frame = make_raw_frame(options.server.max_message_size +
+        .frame = make_raw_frame(options.server.common_parameters.max_message_size +
                                     pqrs::unix_domain_stream::impl::protocol::type_size +
                                     pqrs::unix_domain_stream::impl::protocol::request_id_size +
                                     1,

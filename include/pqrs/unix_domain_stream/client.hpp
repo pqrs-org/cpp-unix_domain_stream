@@ -161,7 +161,7 @@ public:
   void async_request(const std::vector<uint8_t>& data,
                      async_request_callback callback) {
     async_request(data,
-                  options_.read_timeout,
+                  options_.common_parameters.read_timeout,
                   callback);
   }
 
@@ -518,7 +518,7 @@ private:
 
           connect();
         },
-        impl::normalize_scheduling_interval(options_.reconnect_interval));
+        impl::normalize_scheduling_interval(options_.client_parameters.reconnect_interval));
   }
 
   // This method is executed in the shared I/O runtime thread.
@@ -537,7 +537,7 @@ private:
                                    timeout,
                                    callback,
                                    [this, notification_token = notification_scope_.capture()] {
-                                     if (options_.invalidate_connection_on_request_error) {
+                                     if (options_.common_parameters.invalidate_connection_on_request_error) {
                                        if (close_peer(asio::error::connection_reset)) {
                                          notification_scope_.enqueue(
                                              notification_token,

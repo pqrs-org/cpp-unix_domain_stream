@@ -180,7 +180,7 @@ public:
                      async_request_callback callback) {
     async_request(id,
                   data,
-                  options_.read_timeout,
+                  options_.common_parameters.read_timeout,
                   callback);
   }
 
@@ -539,7 +539,7 @@ private:
 
           bind();
         },
-        impl::normalize_scheduling_interval(options_.bind_retry_interval));
+        impl::normalize_scheduling_interval(options_.server_parameters.bind_retry_interval));
   }
 
   // This method is executed in the dispatcher thread.
@@ -552,7 +552,7 @@ private:
         [this] {
           socket_path_health_check();
         },
-        impl::normalize_scheduling_interval(options_.socket_path_health_check_interval));
+        impl::normalize_scheduling_interval(options_.server_parameters.socket_path_health_check_interval));
   }
 
   // This method is executed in the dispatcher thread.
@@ -587,7 +587,7 @@ private:
 
           not_null_shared_ptr_t<asio::local::stream_protocol::socket> socket(std::make_shared<asio::local::stream_protocol::socket>(self->io_ctx_));
 
-          timeout->expires_after(self->options_.socket_path_health_check_timeout);
+          timeout->expires_after(self->options_.server_parameters.socket_path_health_check_timeout);
           timeout->async_wait([self, socket, timeout, notification_token](const auto& error_code) {
             // Cancellation must also close a probe whose connect is still pending.
             asio::error_code close_error_code;
@@ -760,7 +760,7 @@ private:
                                    timeout,
                                    callback,
                                    [this, peer_id_value] {
-                                     if (options_.invalidate_connection_on_request_error) {
+                                     if (options_.common_parameters.invalidate_connection_on_request_error) {
                                        close_peer(peer_id_value);
                                      }
                                    });

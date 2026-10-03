@@ -108,9 +108,7 @@ struct test_options final {
     pqrs::unix_domain_stream::server_options::initialization_parameters server;
   };
 
-  test_options() : client(),
-                   server() {
-  }
+  test_options() = default;
 
   explicit test_options(const initialization_parameters& parameters)
       : client(parameters.common,

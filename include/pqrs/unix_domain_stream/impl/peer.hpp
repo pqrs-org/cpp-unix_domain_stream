@@ -461,9 +461,9 @@ private:
 
   asio::local::stream_protocol::socket socket_;
   common_options options_;
-  std::atomic_bool closed_on_executor_ = false;
-  bool ready_ = false;
-  bool close_after_write_ = false;
+  std::atomic_bool closed_on_executor_{false};
+  bool ready_{false};
+  bool close_after_write_{false};
   asio::steady_timer ready_deadline_;
   asio::steady_timer heartbeat_timer_;
   asio::steady_timer heartbeat_deadline_;

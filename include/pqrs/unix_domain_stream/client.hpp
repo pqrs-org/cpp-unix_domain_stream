@@ -579,7 +579,7 @@ private:
   // connect attempts are ignored after async_invalidate_connection.
   std::shared_ptr<asio::local::stream_protocol::socket> connecting_socket_;
   std::shared_ptr<peer> peer_;
-  std::atomic_bool shutdown_started_ = false;
+  std::atomic_bool shutdown_started_{false};
   // Construct after potentially throwing members; destruction requires detach.
   dispatcher::extra::debounced_task reconnect_task_;
 };

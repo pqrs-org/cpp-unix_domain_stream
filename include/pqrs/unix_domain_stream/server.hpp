@@ -788,8 +788,8 @@ private:
   // The active timer also identifies the individual probe on the I/O thread.
   // Late callbacks from a completed probe must not affect its successor.
   std::shared_ptr<asio::steady_timer> socket_path_health_check_timeout_;
-  peer_id next_peer_id_ = 0;
-  std::atomic_bool shutdown_started_ = false;
+  peer_id next_peer_id_{0};
+  std::atomic_bool shutdown_started_{false};
   // Construct after potentially throwing members; destruction requires detach.
   dispatcher::extra::debounced_task bind_retry_task_;
   dispatcher::extra::timer socket_path_health_check_timer_;

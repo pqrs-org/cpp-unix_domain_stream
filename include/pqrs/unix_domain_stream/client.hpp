@@ -57,12 +57,7 @@ public:
       : dispatcher_client(weak_dispatcher),
         socket_file_path_(socket_file_path),
         options_(options),
-        verify_peer_(verify_peer),
-        notification_scope_(*this),
-        io_ctx_(runtime::get_io_context()),
-        request_manager_(io_ctx_,
-                         *this),
-        reconnect_task_(*this) {
+        verify_peer_(verify_peer) {
     dispatcher_client_constructor_exception_guard_.initialize();
   }
 
@@ -569,10 +564,11 @@ private:
   std::filesystem::path socket_file_path_;
   client_options options_;
   std::function<bool(const peer_credentials&)> verify_peer_;
-  notification_scope notification_scope_;
 
-  asio::io_context& io_ctx_;
-  request_manager request_manager_;
+  notification_scope notification_scope_{*this};
+  asio::io_context& io_ctx_{runtime::get_io_context()};
+  request_manager request_manager_{io_ctx_,
+                                   *this};
 
   // Keeps the current async_connect attempt alive and lets stop/invalidate
   // close it. Completion handlers compare against this pointer so stale
@@ -580,8 +576,9 @@ private:
   std::shared_ptr<asio::local::stream_protocol::socket> connecting_socket_;
   std::shared_ptr<peer> peer_;
   std::atomic_bool shutdown_started_{false};
+
   // Construct after potentially throwing members; destruction requires detach.
-  dispatcher::extra::debounced_task reconnect_task_;
+  dispatcher::extra::debounced_task reconnect_task_{*this};
 };
 
 } // namespace impl

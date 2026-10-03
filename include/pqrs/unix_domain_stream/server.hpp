@@ -66,13 +66,7 @@ public:
       : dispatcher_client(weak_dispatcher),
         socket_file_path_(socket_file_path),
         options_(options),
-        verify_peer_(verify_peer),
-        notification_scope_(*this),
-        io_ctx_(runtime::get_io_context()),
-        request_manager_(io_ctx_,
-                         *this),
-        bind_retry_task_(*this),
-        socket_path_health_check_timer_(*this) {
+        verify_peer_(verify_peer) {
     dispatcher_client_constructor_exception_guard_.initialize();
   }
 
@@ -772,10 +766,11 @@ private:
   std::filesystem::path socket_file_path_;
   server_options options_;
   std::function<bool(const peer_credentials&)> verify_peer_;
-  notification_scope notification_scope_;
 
-  asio::io_context& io_ctx_;
-  request_manager request_manager_;
+  notification_scope notification_scope_{*this};
+  asio::io_context& io_ctx_{runtime::get_io_context()};
+  request_manager request_manager_{io_ctx_,
+                                   *this};
   std::unique_ptr<asio::local::stream_protocol::acceptor> acceptor_;
   // Remember the absolute path resolved when the socket file was created.
   // If a symlink in an intermediate directory changes while the server is
@@ -790,9 +785,10 @@ private:
   std::shared_ptr<asio::steady_timer> socket_path_health_check_timeout_;
   peer_id next_peer_id_{0};
   std::atomic_bool shutdown_started_{false};
+
   // Construct after potentially throwing members; destruction requires detach.
-  dispatcher::extra::debounced_task bind_retry_task_;
-  dispatcher::extra::timer socket_path_health_check_timer_;
+  dispatcher::extra::debounced_task bind_retry_task_{*this};
+  dispatcher::extra::timer socket_path_health_check_timer_{*this};
 };
 
 } // namespace impl

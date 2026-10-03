@@ -43,12 +43,7 @@ public:
        const common_options& options)
       : dispatcher_client(weak_dispatcher),
         socket_(std::move(socket)),
-        options_(options),
-        ready_deadline_(socket_.get_executor()),
-        heartbeat_timer_(socket_.get_executor()),
-        heartbeat_deadline_(socket_.get_executor()),
-        read_deadline_(socket_.get_executor()),
-        write_deadline_(socket_.get_executor()) {
+        options_(options) {
     dispatcher_client_constructor_exception_guard_.initialize();
   }
 
@@ -461,14 +456,15 @@ private:
 
   asio::local::stream_protocol::socket socket_;
   common_options options_;
+
   std::atomic_bool closed_on_executor_{false};
   bool ready_{false};
   bool close_after_write_{false};
-  asio::steady_timer ready_deadline_;
-  asio::steady_timer heartbeat_timer_;
-  asio::steady_timer heartbeat_deadline_;
-  asio::steady_timer read_deadline_;
-  asio::steady_timer write_deadline_;
+  asio::steady_timer ready_deadline_{socket_.get_executor()};
+  asio::steady_timer heartbeat_timer_{socket_.get_executor()};
+  asio::steady_timer heartbeat_deadline_{socket_.get_executor()};
+  asio::steady_timer read_deadline_{socket_.get_executor()};
+  asio::steady_timer write_deadline_{socket_.get_executor()};
   std::array<uint8_t, protocol::header_size> read_header_;
   std::vector<uint8_t> read_body_;
   std::deque<std::vector<uint8_t>> write_queue_;

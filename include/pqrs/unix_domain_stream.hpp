@@ -1,6 +1,6 @@
 #pragma once
 
-// pqrs::unix_domain_stream v5.0.0
+// pqrs::unix_domain_stream v5.1.0
 
 // (C) Copyright Takayama Fumihiko 2026.
 // Distributed under the Boost Software License, Version 1.0.
